@@ -545,11 +545,38 @@
     const container = findElement(SELECTORS.CARD_CONTAINER);
     const cardElements = findAllElements(SELECTORS.CARD_ITEM, container || document);
     
+    // 搜寻页面上所有可能的可见弹窗 HTML
+    const docs = [document];
+    if (window.parent && window.parent.document && window.parent.document !== document) {
+      docs.push(window.parent.document);
+    }
+    const containerDoc = container ? container.ownerDocument : null;
+    if (containerDoc && !docs.includes(containerDoc)) {
+      docs.push(containerDoc);
+    }
+
+    const activeDialogs = [];
+    for (const docObj of docs) {
+      try {
+        const dialogEls = docObj.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"], [class*="recommend-filter-guide"], [class*="dialog"]');
+        for (const el of dialogEls) {
+          const rect = el.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            activeDialogs.push({
+              class: el.className,
+              html: el.outerHTML.slice(0, 10000)
+            });
+          }
+        }
+      } catch (e) {}
+    }
+
     const info = {
       url: window.location.href,
       cardsCount: cardElements.length,
       firstCardHtml: cardElements[0] ? cardElements[0].outerHTML.slice(0, 8000) : '未找到任何候选人卡片',
       parentContainerHtml: container ? container.outerHTML.slice(0, 5000) : '未找到候选人容器',
+      activeDialogs: activeDialogs,
       diagnosticsText: getDOMDiagnosticsText()
     };
 
@@ -572,8 +599,15 @@
         
         document.getElementById('copilot-btn-copy-debug').onclick = async () => {
           const btn = document.getElementById('copilot-btn-copy-debug');
+          // 重新实时抓取最新的页面 DOM 状态以捕获新出现的弹窗！
+          const latestInfo = collectPageDebugInfo();
+          const latestText = JSON.stringify(latestInfo, null, 2);
+          if (debugTextarea) {
+            debugTextarea.value = latestText;
+          }
+
           try {
-            await navigator.clipboard.writeText(debugText);
+            await navigator.clipboard.writeText(latestText);
             btn.textContent = '✅ 已成功复制调试数据！';
             btn.style.background = '#10b981';
             setTimeout(() => {
@@ -582,7 +616,9 @@
             }, 2000);
           } catch (err) {
             // 备选复制
-            debugTextarea.select();
+            if (debugTextarea) {
+              debugTextarea.select();
+            }
             document.execCommand('copy');
             btn.textContent = '✅ 已成功复制调试数据！';
             btn.style.background = '#10b981';
