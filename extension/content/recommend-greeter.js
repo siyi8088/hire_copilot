@@ -225,8 +225,20 @@
       .filter(t => t)
       .join(' | ');
 
-    // 打招呼按钮
-    const greetBtn = findElement(SELECTORS.GREET_BUTTON, cardEl);
+    // 打招呼按钮 (优先使用选择器查找，若未找到，则通过按钮文本内容进行兜底匹配)
+    let greetBtn = findElement(SELECTORS.GREET_BUTTON, cardEl);
+    if (!greetBtn) {
+      const allButtons = cardEl.querySelectorAll('button, a, span[class*="btn"], div[class*="btn"]');
+      for (const btn of allButtons) {
+        const text = btn.textContent?.trim() || '';
+        if (text === '打招呼' || text === '立即沟通' || text === '聊一聊' || text === '沟通' || text.includes('沟通') || text.includes('打招呼')) {
+          if (text.length < 10) { // 限制文本长度以防止误匹配大型容器
+            greetBtn = btn;
+            break;
+          }
+        }
+      }
+    }
 
     // 生成指纹用于去重
     const fingerprint = `${name}_${salary}_${expMatch?.[1] || ''}`;
@@ -1107,6 +1119,40 @@
         // 点击打招呼按钮
         greetBtn.click();
         console.log(`${LOG_PREFIX} ✅ 已点击 ${candidate.name} 的打招呼按钮`);
+        
+        // 拟人化：等待弹窗渲染（0.8s - 1.5s）并自动确认职位关联或打招呼确认弹窗
+        await sim.sleep(sim.clampedGaussian(1000, 200, 800, 1500));
+        
+        const doc = greetBtn.ownerDocument || document;
+        const dialogs = doc.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"]');
+        let dialogClicked = false;
+        
+        for (const dialog of dialogs) {
+          const rect = dialog.getBoundingClientRect();
+          // 只检查在屏幕上渲染可见的弹窗
+          if (rect.width > 0 && rect.height > 0) {
+            console.log(`${LOG_PREFIX} 检测到可见确认弹窗，尝试自动点击“确定/发送”按钮...`);
+            
+            // 查找弹窗内的所有交互按钮
+            const buttons = dialog.querySelectorAll('button, a, span[class*="btn"], div[class*="btn"]');
+            for (const btn of buttons) {
+              const text = btn.textContent?.trim() || '';
+              if (text === '确定' || text === '确认' || text === '发送' || text === '同意' || 
+                  text.includes('确定') || text.includes('确认') || text.includes('发送')) {
+                btn.click();
+                console.log(`${LOG_PREFIX} ✅ 已自动确认弹窗: "${text}"`);
+                dialogClicked = true;
+                break;
+              }
+            }
+            if (dialogClicked) {
+              // 确认后给弹窗一点点关闭动画的缓冲时间
+              await sim.sleep(500);
+              break;
+            }
+          }
+        }
+        
         state.stats.greeted++;
 
         // 通知后端记录
