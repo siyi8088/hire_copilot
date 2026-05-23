@@ -538,7 +538,65 @@
       });
     }
   }
+  /**
+   * 收集页面 HTML 结构进行调试，用于针对性分析选择器
+   */
+  function collectPageDebugInfo() {
+    const container = findElement(SELECTORS.CARD_CONTAINER);
+    const cardElements = findAllElements(SELECTORS.CARD_ITEM, container || document);
+    
+    const info = {
+      url: window.location.href,
+      cardsCount: cardElements.length,
+      firstCardHtml: cardElements[0] ? cardElements[0].outerHTML.slice(0, 8000) : '未找到任何候选人卡片',
+      parentContainerHtml: container ? container.outerHTML.slice(0, 5000) : '未找到候选人容器',
+      diagnosticsText: getDOMDiagnosticsText()
+    };
 
+    return info;
+  }
+
+  /**
+   * 填充并展示调试信息容器
+   */
+  function showPageDebugInfo() {
+    try {
+      const debugInfo = collectPageDebugInfo();
+      const debugText = JSON.stringify(debugInfo, null, 2);
+      const debugTextarea = document.getElementById('copilot-debug-text');
+      const debugContainer = document.getElementById('copilot-debug-container');
+      
+      if (debugTextarea && debugContainer) {
+        debugTextarea.value = debugText;
+        debugContainer.style.display = 'block';
+        
+        document.getElementById('copilot-btn-copy-debug').onclick = async () => {
+          const btn = document.getElementById('copilot-btn-copy-debug');
+          try {
+            await navigator.clipboard.writeText(debugText);
+            btn.textContent = '✅ 已成功复制调试数据！';
+            btn.style.background = '#10b981';
+            setTimeout(() => {
+              btn.textContent = '📋 复制页面 HTML 信息 (发给 AI 修复)';
+              btn.style.background = '#6366f1';
+            }, 2000);
+          } catch (err) {
+            // 备选复制
+            debugTextarea.select();
+            document.execCommand('copy');
+            btn.textContent = '✅ 已成功复制调试数据！';
+            btn.style.background = '#10b981';
+            setTimeout(() => {
+              btn.textContent = '📋 复制页面 HTML 信息 (发给 AI 修复)';
+              btn.style.background = '#6366f1';
+            }, 2000);
+          }
+        };
+      }
+    } catch (e) {
+      console.error('填充调试信息失败:', e);
+    }
+  }
   /**
    * 滚动加载更多候选人
    */
@@ -767,6 +825,13 @@
 
       <div class="crp-candidates" id="crp-candidates-list">
         <!-- 候选人卡片将在这里动态生成 -->
+      </div>
+
+      <div id="copilot-debug-container" style="margin: 10px 16px; display: none; text-align: left;">
+        <button class="crp-btn" id="copilot-btn-copy-debug" style="width: 100%; margin-bottom: 8px; background: #6366f1; color: white; padding: 6px; font-size: 11px; border-radius: 4px; border: none; cursor: pointer;">
+          📋 复制页面 HTML 信息 (发给 AI 修复)
+        </button>
+        <textarea id="copilot-debug-text" style="width: 100%; height: 100px; background: #111827; color: #9ca3af; border: 1px solid #374151; border-radius: 6px; padding: 6px; font-size: 9px; font-family: monospace; resize: none;" readonly></textarea>
       </div>
 
       <div class="crp-footer" id="crp-footer">
@@ -1010,6 +1075,9 @@
       scanBtn.disabled = false;
       scanBtn.textContent = '🔍 重新扫描';
     }
+
+    // 渲染并填充页面 HTML 调试收集器信息
+    showPageDebugInfo();
   }
 
   /**
