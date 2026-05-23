@@ -25,7 +25,7 @@ from services.rate_limiter import rate_limiter
 logger = logging.getLogger(__name__)
 
 # 每批评估的候选人数量上限（控制 Token 开销）
-BATCH_EVAL_SIZE = 8
+BATCH_EVAL_SIZE = 3
 # 最低匹配分（低于此分的候选人不推荐）
 MIN_MATCH_SCORE = 6.5
 # 每日打招呼硬限制
