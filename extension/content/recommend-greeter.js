@@ -589,7 +589,8 @@
       console.log(`${LOG_PREFIX} 滚动 ${i + 1}/${maxScrolls}, 已收集 ${allCandidates.size} 人`);
     }
 
-    return [...allCandidates.values()];
+    // 严格限制返回的候选人数量不超过 maxCount，防止页面预加载了过多卡片导致评估超时
+    return [...allCandidates.values()].slice(0, maxCount);
   }
 
   // ============================================================
