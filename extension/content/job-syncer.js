@@ -1,0 +1,1041 @@
+/**
+ * job-syncer.js
+ * Boss直聘"职位管理"页面 — 自动同步活跃岗位详细 JD
+ *
+ * 运行在: https://www.zhipin.com/web/chat/job/list*
+ */
+
+(() => {
+  'use strict';
+
+  const LOG_PREFIX = '[HireCopilot:JobSyncer]';
+  const VERSION = '0.2.0';
+
+  let syncOverlay = null;
+
+  // ============================================================
+  // UI 样式注入
+  // ============================================================
+  function injectStyles() {
+    const styleId = 'copilot-job-syncer-styles';
+    if (document.getElementById(styleId)) return;
+
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+      /* 同步控制按钮 */
+      .copilot-sync-btn {
+        position: fixed;
+        top: 20px;
+        right: 180px;
+        z-index: 10000;
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+        color: #ffffff;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        padding: 10px 18px;
+        border-radius: 9999px;
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        backdrop-filter: blur(8px);
+      }
+
+      .copilot-sync-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6);
+        background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+      }
+
+      .copilot-sync-btn:active {
+        transform: translateY(0);
+      }
+
+      .copilot-sync-btn .robot-icon {
+        font-size: 16px;
+        animation: pulse 2s infinite;
+      }
+
+      @keyframes pulse {
+        0% { transform: scale(1); }
+        50% { transform: scale(1.15); }
+        100% { transform: scale(1); }
+      }
+
+      /* 同步全屏遮罩 */
+      .copilot-sync-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        background: rgba(10, 10, 15, 0.75);
+        backdrop-filter: blur(12px);
+        z-index: 20000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: 'Inter', system-ui, sans-serif;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.4s ease;
+      }
+
+      .copilot-sync-overlay.active {
+        opacity: 1;
+        pointer-events: auto;
+      }
+
+      .copilot-sync-card {
+        background: rgba(20, 20, 30, 0.9);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 20px;
+        width: 480px;
+        padding: 40px;
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+        text-align: center;
+        transform: scale(0.9);
+        transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+      }
+
+      .copilot-sync-overlay.active .copilot-sync-card {
+        transform: scale(1);
+      }
+
+      .copilot-sync-icon {
+        font-size: 48px;
+        margin-bottom: 24px;
+        display: inline-block;
+        animation: rotate 3s linear infinite;
+      }
+
+      @keyframes rotate {
+        100% { transform: rotate(360deg); }
+      }
+
+      .copilot-sync-title {
+        color: #ffffff;
+        font-size: 20px;
+        font-weight: 700;
+        margin-bottom: 12px;
+      }
+
+      .copilot-sync-desc {
+        color: #9493a5;
+        font-size: 14px;
+        line-height: 1.6;
+        margin-bottom: 30px;
+      }
+
+      .copilot-progress-bar {
+        background: rgba(255, 255, 255, 0.05);
+        border-radius: 9999px;
+        height: 6px;
+        width: 100%;
+        margin-bottom: 16px;
+        overflow: hidden;
+        position: relative;
+      }
+
+      .copilot-progress-fill {
+        background: linear-gradient(90deg, #6366f1 0%, #10b981 100%);
+        height: 100%;
+        width: 0%;
+        border-radius: 9999px;
+        transition: width 0.4s ease;
+      }
+
+      .copilot-progress-text {
+        color: #00f5c4;
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      /* 成功后的返回按钮 */
+      .copilot-success-actions {
+        display: flex;
+        gap: 12px;
+        justify-content: center;
+        margin-top: 10px;
+      }
+
+      .copilot-action-btn {
+        padding: 10px 20px;
+        border-radius: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        border: none;
+        transition: all 0.2s;
+      }
+
+      .copilot-btn-primary {
+        background: #10b981;
+        color: #fff;
+      }
+
+      .copilot-btn-primary:hover {
+        background: #059669;
+      }
+
+      .copilot-btn-secondary {
+        background: rgba(255, 255, 255, 0.08);
+        color: #fff;
+      }
+
+      .copilot-btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.15);
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // ============================================================
+  // UI 元素创建
+  // ============================================================
+  function createUI() {
+    // 注入同步按钮
+    const btn = document.createElement('button');
+    btn.className = 'copilot-sync-btn';
+    btn.innerHTML = `
+      <span class="robot-icon">🤖</span>
+      <span>同步活跃岗位</span>
+    `;
+    document.body.appendChild(btn);
+
+    // 注入同步进度模态框
+    const overlay = document.createElement('div');
+    overlay.className = 'copilot-sync-overlay';
+    overlay.id = 'copilot-sync-overlay';
+    overlay.innerHTML = `
+      <div class="copilot-sync-card">
+        <div class="copilot-sync-icon" id="copilot-sync-icon">🔄</div>
+        <div class="copilot-sync-title" id="copilot-sync-title">同步中...</div>
+        <div class="copilot-sync-desc" id="copilot-sync-desc">正在扫描您的活跃岗位，请勿关闭或刷新此页面。</div>
+        <div class="copilot-progress-bar">
+          <div class="copilot-progress-fill" id="copilot-progress-fill"></div>
+        </div>
+        <div class="copilot-progress-text" id="copilot-progress-text">准备就绪...</div>
+        <div class="copilot-success-actions" id="copilot-success-actions" style="display: none;">
+          <button class="copilot-action-btn copilot-btn-primary" id="copilot-btn-go-recommend">🔍 去推荐牛人</button>
+          <button class="copilot-action-btn copilot-btn-secondary" id="copilot-btn-close-sync">关闭</button>
+        </div>
+        <div id="copilot-debug-container" style="margin-top: 20px; display: none; text-align: left;">
+          <button class="copilot-action-btn" id="copilot-btn-copy-debug" style="width: 100%; margin-bottom: 10px; background: #6366f1; color: white; border: none; padding: 10px; border-radius: 8px; font-weight: 600; cursor: pointer;">📋 一键复制页面 HTML 信息 (发给 AI 修复)</button>
+          <textarea id="copilot-debug-text" style="width: 100%; height: 120px; background: #111827; color: #9ca3af; border: 1px solid #374151; border-radius: 6px; padding: 8px; font-size: 11px; font-family: monospace; resize: vertical;" readonly></textarea>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    syncOverlay = overlay;
+
+    // 绑定按钮事件
+    btn.addEventListener('click', startSyncFlow);
+    document.getElementById('copilot-btn-close-sync').addEventListener('click', () => {
+      overlay.classList.remove('active');
+    });
+    document.getElementById('copilot-btn-go-recommend').addEventListener('click', () => {
+      window.location.href = 'https://www.zhipin.com/web/chat/recommend';
+    });
+  }
+
+  // ============================================================
+  // DOM 穿透查找辅助函数 (Traverse same-origin iframes)
+  // ============================================================
+  function findElement(selector, parent = document) {
+    try {
+      const el = parent.querySelector(selector);
+      if (el) return el;
+    } catch (e) {}
+
+    const iframes = parent.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const innerDoc = iframe.contentDocument || iframe.contentWindow.document;
+        if (innerDoc) {
+          const el = findElement(selector, innerDoc);
+          if (el) return el;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function findAllElements(selector, parent = document) {
+    let results = [];
+    try {
+      const els = parent.querySelectorAll(selector);
+      if (els.length > 0) results = [...els];
+    } catch (e) {}
+
+    const iframes = parent.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const innerDoc = iframe.contentDocument || iframe.contentWindow.document;
+        if (innerDoc) {
+          results = results.concat(findAllElements(selector, innerDoc));
+        }
+      } catch (e) {}
+    }
+    return results;
+  }
+
+  // ============================================================
+  // 核心同步逻辑
+  // ============================================================
+
+  /**
+   * 自动寻找所有的“开放中”岗位卡片
+   */
+  function findActiveJobCards() {
+    const cardSelectors = [
+      'div.job-item',
+      'div.job-card',
+      'div[class*="job-card"]',
+      'div[class*="job-item"]',
+      'div[class*="position-item"]',
+      'li.job-card',
+      '.job-list-item'
+    ];
+
+    let cardElements = [];
+    for (const sel of cardSelectors) {
+      const els = findAllElements(sel);
+      if (els.length > 0) {
+        cardElements = els;
+        break;
+      }
+    }
+
+    // 兜底方案：通过“编辑”和“开放中”特征查找行卡片
+    if (cardElements.length === 0) {
+      const allDivs = findAllElements('div, li');
+      const seen = new Set();
+      for (const el of allDivs) {
+        const txt = el.textContent || '';
+        if (txt.includes('编辑') && (txt.includes('开放中') || txt.includes('待开放') || txt.includes('关闭')) && el.children.length > 1) {
+          if (el.querySelector('button, a') && txt.length < 500) {
+            let hasAncestor = false;
+            let parent = el.parentElement;
+            while (parent) {
+              if (seen.has(parent)) {
+                hasAncestor = true;
+                break;
+              }
+              parent = parent.parentElement;
+            }
+            if (!hasAncestor) {
+              cardElements.push(el);
+              seen.add(el);
+            }
+          }
+        }
+      }
+    }
+
+    // 过滤出状态为“开放中”的岗位
+    const activeCards = cardElements.filter(el => {
+      const text = el.textContent || '';
+      return text.includes('开放中');
+    });
+
+    console.log(`${LOG_PREFIX} 共找到 ${cardElements.length} 个岗位，其中活跃岗 ${activeCards.length} 个`);
+    return activeCards;
+  }
+
+  /**
+   * 打开岗位的详情弹窗/抽屉
+   */
+  async function openJobPreview(cardEl) {
+    // 1. 尝试通过“三个点 ➔ 预览”的交互链，打开“静态预览弹窗”（此方式速度最快，且不涉及SPA页面跳转或表单输入）
+    try {
+      // 优先精确定位三个点图标/按钮，并发起 mouseenter / mouseover 事件，模拟悬停以防有悬浮处理
+      let moreBtn = cardEl.querySelector('.dot');
+      if (!moreBtn) {
+        moreBtn = cardEl.querySelector('.more-operate, [class*="more-operate"]');
+      }
+      if (moreBtn) {
+        console.log(`${LOG_PREFIX} 模拟悬停与点击三个点按钮以激活状态...`);
+        moreBtn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+        moreBtn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+        moreBtn.click();
+        await new Promise(r => setTimeout(r, 300));
+      }
+
+      // 无论下拉菜单当前在 CSS 中是否可见，HTML 结构显示下拉项已经在 cardEl DOM 内。
+      // 直接定位 cardEl 内部文本为“预览”的元素并进行点击。
+      const previewItems = [...cardEl.querySelectorAll('.job-operate-item, .job-operate-container li, li, a, span')];
+      const previewItem = previewItems.find(el => el.textContent?.trim() === '预览');
+
+      if (previewItem) {
+        console.log(`${LOG_PREFIX} 成功定位到“预览”项，直接触发点击:`, previewItem);
+        previewItem.click();
+        await new Promise(r => setTimeout(r, 1500)); // 等待预览面板完全渲染
+        
+        // 验证是否已成功弹出预览容器
+        const previewEl = findPreviewContainer();
+        if (previewEl) {
+          console.log(`${LOG_PREFIX} ✅ 成功开启静态预览容器`);
+          return;
+        }
+      } else {
+        console.warn(`${LOG_PREFIX} 未能在岗位卡片中找到“预览”项`);
+      }
+    } catch (e) {
+      console.warn(`${LOG_PREFIX} 尝试“三个点 ➔ 预览”交互失败:`, e);
+    }
+
+    // 2. 降级方案：在全局 (包含 Iframe) 中模糊查找所有包含“预览”文本的项尝试点击
+    console.log(`${LOG_PREFIX} 降级：在全局查找“预览”选项进行点击...`);
+    try {
+      const globalItems = findAllElements('.job-operate-item, li, a, span');
+      const previewItem = globalItems.find(el => el.textContent?.trim() === '预览');
+      if (previewItem) {
+        console.log(`${LOG_PREFIX} 找到全局“预览”项，尝试点击:`, previewItem);
+        previewItem.click();
+        await new Promise(r => setTimeout(r, 1500));
+        const previewEl = findPreviewContainer();
+        if (previewEl) {
+          console.log(`${LOG_PREFIX} ✅ 通过全局预览项成功开启静态预览容器`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn(`${LOG_PREFIX} 降级全局预览点击失败:`, e);
+    }
+
+    // 3. 降级方案：寻找卡片内是否有直接暴露出来的“预览”或“详情”字样按钮，但绝不直接点击卡片/标题（防止页面跳转到编辑页）
+    console.log(`${LOG_PREFIX} 尝试在卡片中查找直接暴露的预览/查看详情按钮`);
+    const actionElements = [...cardEl.querySelectorAll('button, a, span, div')];
+    const previewBtn = actionElements.find(el => {
+      const txt = el.textContent?.trim() || '';
+      // 精确匹配，且不应该是标题链接或卡片自身
+      return (txt === '预览' || txt === '详情' || txt.includes('查看详情') || txt.includes('岗位详情')) && 
+             el.tagName !== 'A' && el.getBoundingClientRect().width > 0;
+    });
+
+    if (previewBtn) {
+      console.log(`${LOG_PREFIX} 找到直接预览按钮并点击:`, previewBtn);
+      previewBtn.click();
+      await new Promise(r => setTimeout(r, 1500));
+      const previewEl = findPreviewContainer();
+      if (previewEl) {
+        console.log(`${LOG_PREFIX} ✅ 通过直接预览按钮成功开启静态预览容器`);
+        return;
+      }
+    }
+
+    // 如果以上都失败，抛出错误，中止同步流程，防止进入编辑页面
+    throw new Error('无法通过“三个点 ➔ 预览”打开该职位的详情弹窗，已阻止页面跳转到编辑页以保护数据。');
+  }
+
+  /**
+   * 查找页面当前可见的详情预览弹窗/抽屉/面板
+   */
+  function findPreviewContainer() {
+    // 扩展选择器，覆盖更多可能的抽屉/对话框/详情容器，并支持更多 HTML5 语义标签
+    const selectors = [
+      'div[class*="drawer"]',
+      'section[class*="drawer"]',
+      'aside[class*="drawer"]',
+      'div[class*="dialog"]',
+      'div[class*="modal"]',
+      'div[class*="detail"]',
+      'section[class*="detail"]',
+      'aside[class*="detail"]',
+      'div[class*="preview"]',
+      'section[class*="preview"]',
+      'div[class*="popup"]',
+      'div[class*="aside"]',
+      'div[class*="pane"]',
+      'div[class*="panel"]',
+      'div[class*="wrap"]',
+      '.detail-dialog',
+      '.job-detail-box',
+      '.job-detail-dialog',
+      '.job-detail-drawer',
+      '.job-drawer',
+      '.job-preview',
+      '.preview-drawer',
+      '.preview-box',
+      '.preview-container',
+      '.detail-box',
+      '.detail-container',
+      '.chat-right',
+      '.job-detail',
+      '.chat-detail',
+      '.chat-info'
+    ];
+
+    console.log(`${LOG_PREFIX} 正在查找详情预览容器...`);
+
+    for (const sel of selectors) {
+      const els = findAllElements(sel);
+      for (const el of els) {
+        try {
+          const win = el.ownerDocument.defaultView || window;
+          const style = win.getComputedStyle(el);
+          if (style.display !== 'none' && style.visibility !== 'hidden') {
+            const txt = el.textContent || '';
+            // 检查常见的 JD 词汇特征
+            if (txt.includes('职位详情') || txt.includes('职位要求') || txt.includes('职责') || txt.includes('要求') || txt.includes('描述') || txt.includes('工作职责') || txt.includes('岗位职责') || txt.includes('薪资') || txt.includes('任职资格') || txt.includes('任职要求')) {
+              console.log(`${LOG_PREFIX} 找到预览容器 (Selector: ${sel}):`, el);
+              return el;
+            }
+          }
+        } catch (e) {
+          console.warn(`${LOG_PREFIX} 获取元素样式出错:`, e);
+        }
+      }
+    }
+
+    // 备用兜底查找：查找任何包含“职责/要求”字样的可见元素，并往上寻找定位容器或合适大小的容器
+    console.log(`${LOG_PREFIX} 未通过常规选择器找到容器，尝试兜底寻找包含职责/要求关键词的可见元素...`);
+    const elements = findAllElements('div, section, aside, article');
+    for (const el of elements) {
+      try {
+        const text = el.textContent || '';
+        // 长度在合适范围，且包含关键 JD 词汇
+        if (text.length > 50 && text.length < 50000) {
+          if (text.includes('工作职责') || text.includes('岗位职责') || text.includes('职位要求') || text.includes('任职要求') || text.includes('任职资格') || text.includes('职位描述')) {
+            const win = el.ownerDocument.defaultView || window;
+            const style = win.getComputedStyle(el);
+            // 只要它是可见的
+            if (style.display !== 'none' && style.visibility !== 'hidden') {
+              // 往上找最近的一个定位容器或者宽度较大的块级容器，作为预览窗口
+              let curr = el;
+              while (curr && curr.tagName !== 'BODY' && curr.tagName !== 'HTML') {
+                const currStyle = curr.ownerDocument.defaultView.getComputedStyle(curr);
+                if (currStyle.display !== 'none' && 
+                    (currStyle.position === 'fixed' || currStyle.position === 'absolute' || currStyle.position === 'relative' || 
+                     curr.className?.includes('drawer') || curr.className?.includes('dialog') || curr.className?.includes('detail') || curr.className?.includes('preview') ||
+                     curr.offsetWidth > 300)) {
+                  console.log(`${LOG_PREFIX} 找到兜底预览容器 (Through ancestor traversal):`, curr);
+                  return curr;
+                }
+                curr = curr.parentElement;
+              }
+              // 如果没找到合适的祖先，直接返回 el 自身
+              console.log(`${LOG_PREFIX} 找到兜底预览容器 (Direct element):`, el);
+              return el;
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    
+    console.warn(`${LOG_PREFIX} 未找到任何详情预览容器`);
+    return null;
+  }
+
+  /**
+   * 从详情预览/编辑页面中解析 JD 字段
+   */
+  async function parsePreviewDetails(previewEl, fallbackData = {}) {
+    const text = previewEl.textContent || '';
+
+    // 1. 点击展开全部（如果存在）
+    const expandBtn = [...previewEl.querySelectorAll('a, span, button')].find(
+      el => el.textContent?.includes('展开全部') || el.textContent?.includes('展开')
+    );
+    if (expandBtn) {
+      try {
+        expandBtn.click();
+        await new Promise(r => setTimeout(r, 500));
+      } catch (e) {
+        console.warn(`${LOG_PREFIX} 点击展开按钮出错:`, e);
+      }
+    }
+
+    // 2. 提取岗位名称
+    let title = '';
+    // 优先从 input[name="jobName"] 或 input.job-name-input 获取 (编辑模式)
+    const titleInput = previewEl.querySelector('input[name="jobName"], input.job-name-input');
+    if (titleInput && titleInput.value) {
+      title = titleInput.value.trim();
+    }
+    
+    // 其次从常规的选择器提取 textContent (预览模式)
+    if (!title) {
+      const titleEls = [...previewEl.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]')];
+      const validTitleEl = titleEls.find(el => {
+        const text = el.textContent || '';
+        return text.length > 0 && text.length < 50 && 
+               !text.includes('基本信息') && 
+               !text.includes('无法修改') && 
+               !text.includes('客户公司') && 
+               !text.includes('职位描述') && 
+               !text.includes('职位要求') && 
+               !text.includes('工作地点') && 
+               !text.includes('招聘类型') && 
+               !text.includes('职位名称');
+      });
+      if (validTitleEl) {
+        title = validTitleEl.textContent.trim();
+      }
+    }
+    
+    // 清洗格式
+    title = title.replace(/代招|匿名/g, '').trim();
+    if (!title && fallbackData.title) {
+      title = fallbackData.title;
+    }
+
+    // 3. 提取公司名称
+    let company = '';
+    // 优先从 input 且 placeholder 包含“客户公司”或其 value 查找 (编辑模式)
+    const companyInput = previewEl.querySelector('input[placeholder*="客户公司"], input[placeholder*="代为招聘"]');
+    if (companyInput && companyInput.value) {
+      company = companyInput.value.trim();
+    }
+    
+    if (!company) {
+      const companyBrandEl = previewEl.querySelector('.brand-info .name, .enterprise-info .name, [class*="company"] .name');
+      if (companyBrandEl) {
+        company = companyBrandEl.textContent.trim();
+      }
+    }
+    
+    if (!company && fallbackData.company) {
+      company = fallbackData.company;
+    }
+
+    // 4. 薪资范围
+    let salary = '';
+    const salaryMatch = previewEl.textContent.match(/(\d+[-~]\d+[Kk万](?:·\d+薪)?)/);
+    if (salaryMatch) {
+      salary = salaryMatch[1];
+    } else {
+      const salaryEl = previewEl.querySelector('[class*="salary"], [class*="pay"]');
+      salary = salaryEl?.textContent?.trim() || '';
+    }
+    
+    if (!salary && fallbackData.salary_range) {
+      salary = fallbackData.salary_range;
+    }
+
+    // 5. 使用 Slicing 方法健壮地获取 JD 描述和任职要求
+    let description = '';
+    let requirements = '';
+    let highlights = '';
+
+    // 优先从 textarea 获取 (编辑模式)
+    const textarea = previewEl.querySelector('textarea');
+    if (textarea && textarea.value) {
+      const fullJD = textarea.value.trim();
+      const reqKeywords = ['职位要求', '任职要求', '任职资格', '岗位要求', '招聘要求', '任职条件'];
+      let splitIdx = -1;
+      let matchedReqLen = 0;
+      for (const kw of reqKeywords) {
+        const idx = fullJD.indexOf(kw);
+        if (idx !== -1) {
+          splitIdx = idx;
+          matchedReqLen = kw.length;
+          break;
+        }
+      }
+      
+      if (splitIdx !== -1) {
+        description = fullJD.substring(0, splitIdx).trim();
+        requirements = fullJD.substring(splitIdx + matchedReqLen).trim();
+      } else {
+        description = fullJD;
+      }
+    } else {
+      // 兜底全文本拿描述 (预览模式)
+      
+      // 寻找描述部分的起始位置
+      const descKeywords = ['职位详情', '岗位职责', '工作职责', '职位描述', '职责描述', '工作内容'];
+      let detailIndex = -1;
+      let matchedDescLen = 0;
+      for (const kw of descKeywords) {
+        const idx = text.indexOf(kw);
+        if (idx !== -1) {
+          detailIndex = idx;
+          matchedDescLen = kw.length;
+          break;
+        }
+      }
+
+      // 寻找要求部分的起始位置
+      const reqKeywords = ['职位要求', '任职要求', '任职资格', '岗位要求', '招聘要求', '任职条件'];
+      let reqIndex = -1;
+      let matchedReqLen = 0;
+      for (const kw of reqKeywords) {
+        const idx = text.indexOf(kw);
+        if (idx !== -1) {
+          reqIndex = idx;
+          matchedReqLen = kw.length;
+          break;
+        }
+      }
+
+      // 寻找工作地址/地点的起始位置作为结束标记
+      const addrKeywords = ['工作地址', '工作地点', '公司地址', '面试地址'];
+      let addrIndex = -1;
+      for (const kw of addrKeywords) {
+        const idx = text.indexOf(kw);
+        if (idx !== -1) {
+          addrIndex = idx;
+          break;
+        }
+      }
+
+      if (detailIndex !== -1) {
+        const endIndex = reqIndex !== -1 ? reqIndex : (addrIndex !== -1 ? addrIndex : text.length);
+        description = text.substring(detailIndex + matchedDescLen, endIndex).trim();
+      } else {
+        if (reqIndex !== -1) {
+          description = text.substring(0, reqIndex).trim();
+        } else {
+          description = text.substring(0, 1500).trim();
+        }
+      }
+
+      if (reqIndex !== -1) {
+        const endIndex = addrIndex !== -1 ? addrIndex : text.length;
+        requirements = text.substring(reqIndex + matchedReqLen, endIndex).trim();
+      }
+    }
+
+    // 6. 工作地点
+    const addrKeywords = ['工作地址', '工作地点', '公司地址', '面试地址'];
+    let addrIndex = -1;
+    for (const kw of addrKeywords) {
+      const idx = text.indexOf(kw);
+      if (idx !== -1) {
+        addrIndex = idx;
+        break;
+      }
+    }
+    if (addrIndex !== -1) {
+      highlights = text.substring(addrIndex).split('\n')[0].trim();
+    } else {
+      // 尝试从 input 获取
+      const addrInput = previewEl.querySelector('input[placeholder*="工作地点"], input[placeholder*="地点"]');
+      if (addrInput && addrInput.value) {
+        highlights = '工作地点：' + addrInput.value.trim();
+      }
+    }
+
+    return {
+      title: title || fallbackData.title || '未知职位',
+      company: company || fallbackData.company || '未知公司',
+      salary_range: salary || fallbackData.salary_range || '薪资面议',
+      requirements: requirements || '无学历要求',
+      description: description || '无岗位详情描述',
+      highlights: highlights || '工作地点见详情',
+    };
+  }
+
+  /**
+   * 关闭详情弹窗/抽屉
+   */
+  async function closeJobPreview(previewEl) {
+    if (!previewEl) return;
+    const closeBtn = previewEl.querySelector('button[class*="close"], span[class*="close"], a[class*="close"], [class*="icon-close"], .close');
+    if (closeBtn) {
+      console.log(`${LOG_PREFIX} 点击关闭按钮`);
+      closeBtn.click();
+    } else {
+      // 查找包含 ✕ 或“关闭”、“取消”字样的按钮元素进行关闭
+      const spans = previewEl.querySelectorAll('span, button, a');
+      const xBtn = [...spans].find(el => {
+        const txt = el.textContent?.trim() || '';
+        return txt === '✕' || txt === '✕ 关闭' || txt.includes('关闭') || txt.includes('取消');
+      });
+      if (xBtn) {
+        console.log(`${LOG_PREFIX} 找到带关闭特征的按钮并点击:`, xBtn);
+        xBtn.click();
+      } else {
+        console.warn(`${LOG_PREFIX} 未能识别到关闭按钮，尝试点击遮罩层或空白区域兜底`);
+        // 尝试点击 previewEl 的外部以触发自收起
+        document.body.click();
+      }
+    }
+    await new Promise(r => setTimeout(r, 1000)); // 保证过渡动画加载完毕，顺利返回主页面
+  }
+
+  /**
+   * 收集页面 HTML 结构进行调试，用于针对性分析选择器
+   */
+  function collectPageDebugInfo(activeCards, previewEl) {
+    const info = {
+      url: window.location.href,
+      cardsCount: activeCards ? activeCards.length : 0,
+      firstCardHtml: activeCards && activeCards[0] ? activeCards[0].outerHTML : '未找到活跃卡片',
+      previewElFound: !!previewEl,
+      previewElHtml: previewEl ? previewEl.outerHTML : '未找到详情预览容器',
+      visibleInputsAndLabels: []
+    };
+
+    // 搜集页面上所有可能的悬浮抽屉/对话框/编辑区域的输入控件及标签特征
+    const container = previewEl || document.body;
+    try {
+      const inputs = container.querySelectorAll('input, textarea, select, button, label, h1, h2, h3, [class*="title"], [class*="name"]');
+      const items = [];
+      inputs.forEach((el, index) => {
+        if (index > 120) return; // 限制大小
+        items.push({
+          tag: el.tagName,
+          id: el.id,
+          class: el.className,
+          placeholder: el.placeholder || el.getAttribute('placeholder') || '',
+          value: el.value || '',
+          text: el.textContent?.trim().slice(0, 150) || '',
+          name: el.name || el.getAttribute('name') || ''
+        });
+      });
+      info.visibleInputsAndLabels = items;
+    } catch (e) {}
+
+    // 如果 previewEl 没找到，抓取最近点击过的卡片周围的 HTML 结构片段
+    if (!previewEl && activeCards && activeCards[0]) {
+      try {
+        const parent = activeCards[0].parentElement;
+        if (parent) {
+          info.parentContainerHtml = parent.outerHTML.slice(0, 5000);
+        }
+      } catch (e) {}
+    }
+
+    return info;
+  }
+
+  /**
+   * 执行一键同步全流程
+   */
+  async function startSyncFlow() {
+    const overlay = document.getElementById('copilot-sync-overlay');
+    const iconEl = document.getElementById('copilot-sync-icon');
+    const titleEl = document.getElementById('copilot-sync-title');
+    const descEl = document.getElementById('copilot-sync-desc');
+    const fillEl = document.getElementById('copilot-progress-fill');
+    const textEl = document.getElementById('copilot-progress-text');
+    const actionsEl = document.getElementById('copilot-success-actions');
+    const debugContainer = document.getElementById('copilot-debug-container');
+
+    // 恢复 UI 状态
+    iconEl.textContent = '🔄';
+    iconEl.style.animation = 'rotate 3s linear infinite';
+    titleEl.textContent = '正在同步中...';
+    descEl.textContent = '正在扫描您的活跃岗位，请勿关闭或刷新此页面。';
+    fillEl.style.width = '0%';
+    textEl.textContent = '正在初始化...';
+    actionsEl.style.display = 'none';
+    if (debugContainer) debugContainer.style.display = 'none';
+
+    overlay.classList.add('active');
+
+    let lastPreviewEl = null;
+    const activeCards = findActiveJobCards();
+
+    try {
+      // 1. 扫描页面中所有的活跃卡片
+      if (activeCards.length === 0) {
+        iconEl.textContent = '⚠️';
+        iconEl.style.animation = 'none';
+        titleEl.textContent = '未检测到活跃岗位';
+        descEl.textContent = '请确保您在“开放中”Tab页下，且页面中有处于“开放中”的招聘职位。';
+        textEl.textContent = '同步中止';
+        actionsEl.style.display = 'flex';
+        if (debugContainer) debugContainer.style.display = 'block';
+        return;
+      }
+
+      // 提取所有活跃岗位信息作为兜底数据
+      const cardDatas = activeCards.map((card, idx) => {
+        let title = '';
+        const titleSelectors = ['.job-title', '.job-name', '.name', 'span.name', 'a.job-name', 'h3', 'div.title', 'span'];
+        for (const sel of titleSelectors) {
+          const el = card.querySelector(sel);
+          if (el && el.textContent?.trim()) {
+            title = el.textContent.replace(/代招|匿名/g, '').trim();
+            break;
+          }
+        }
+        title = title || `未命名岗位${idx + 1}`;
+
+        let company = '';
+        const companyEl = card.querySelector('.brand-info, [class*="brand"], [class*="company"]');
+        if (companyEl) {
+          company = companyEl.textContent.trim();
+        }
+
+        let salary = '';
+        const cardText = card.textContent || '';
+        const salaryMatch = cardText.match(/(\d+[-~]\d+[Kk万](?:·\d+薪)?)/);
+        if (salaryMatch) {
+          salary = salaryMatch[1];
+        }
+
+        return { title, company, salary_range: salary };
+      });
+
+      const jobTitles = cardDatas.map(d => d.title);
+
+      // 弹出确认提示框告知扫描到的岗位名称列表
+      const startConfirm = confirm(
+        `🤖 Copilot 扫描到以下 ${activeCards.length} 个活跃岗位：\n\n` + 
+        jobTitles.map((t, idx) => `${idx + 1}. ${t}`).join('\n') + 
+        `\n\n确定要开始同步这些岗位详细 JD 到后端吗？`
+      );
+
+      if (!startConfirm) {
+        console.log(`${LOG_PREFIX} 用户取消了同步`);
+        overlay.classList.remove('active');
+        return;
+      }
+
+      descEl.innerHTML = `检测到以下活跃岗位：<br><strong style="color: #6366f1; display: block; margin: 10px 0; font-size: 15px;">${jobTitles.join('、')}</strong>正在同步中，请勿关闭或刷新此页面。`;
+      textEl.textContent = `共发现 ${activeCards.length} 个活跃岗位，开始同步...`;
+
+      let successCount = 0;
+      const syncedTitles = [];
+
+      for (let i = 0; i < activeCards.length; i++) {
+        const card = activeCards[i];
+        const fallbackData = cardDatas[i] || {};
+        
+        // 滚动到该卡片
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await new Promise(r => setTimeout(r, 500));
+
+        // 尝试打开预览
+        textEl.textContent = `正在展开第 ${i + 1}/${activeCards.length} 个岗位...`;
+        await openJobPreview(card);
+
+        // 尝试获取预览窗口
+        const previewEl = findPreviewContainer();
+        if (!previewEl) {
+          console.warn(`${LOG_PREFIX} 未找到岗位详情预览容器`);
+          continue;
+        }
+        lastPreviewEl = previewEl;
+
+        // 解析 JD 字段
+        const jobData = await parsePreviewDetails(previewEl, fallbackData);
+        console.log(`${LOG_PREFIX} 解析到岗位详情:`, jobData);
+
+        // 同步发送给后端
+        textEl.textContent = `正在保存 [${jobData.title}] 至后端数据库...`;
+        const response = await sendToBackground({
+          type: 'SAVE_JOB_POST',
+          payload: { jobData }
+        });
+
+        if (response && response.ok) {
+          successCount++;
+          syncedTitles.push(jobData.title);
+        }
+
+        // 关闭预览弹层
+        await closeJobPreview(previewEl);
+
+        // 更新进度条
+        const percent = Math.round(((i + 1) / activeCards.length) * 100);
+        fillEl.style.width = `${percent}%`;
+      }
+
+      // 同步完成，根据结果展示不同的提示
+      if (successCount === 0) {
+        iconEl.textContent = '⚠️';
+        iconEl.style.animation = 'none';
+        titleEl.textContent = '同步未成功';
+        descEl.innerHTML = `已扫描到 ${activeCards.length} 个活跃岗位，但由于详情预览窗口未能被识别打开，未能成功同步数据。<br><br>
+        <span style="color: #f59e0b; font-size: 13px; text-align: left; display: block; line-height: 1.6;">
+        <strong>可能原因：</strong><br>
+        1. 岗位详情抽屉未能成功在页面中渲染。<br>
+        2. 页面处于非活跃窗口或有其他弹层遮挡。<br>
+        请尝试关闭并重新加载页面，并在同步开始后<strong>保持页面在前端展示</strong>。您也可以先手动点击岗位看看是否能正常在右侧展开详情。
+        </span>`;
+        textEl.textContent = '同步完成 (0 个成功)';
+        actionsEl.style.display = 'flex';
+        if (debugContainer) debugContainer.style.display = 'block';
+      } else {
+        iconEl.textContent = '✅';
+        iconEl.style.animation = 'none';
+        titleEl.textContent = '同步成功！';
+        descEl.innerHTML = `已成功同步并激活以下活跃岗位：<br><strong style="color: #10b981; display: block; margin: 10px 0; font-size: 15px;">${syncedTitles.join('、')}</strong>可以在“推荐牛人”中使用这些详细 JD 啦！`;
+        textEl.textContent = '所有数据同步已就绪 🚀';
+        actionsEl.style.display = 'flex';
+        if (debugContainer) debugContainer.style.display = 'none';
+      }
+
+    } catch (err) {
+      console.error(`${LOG_PREFIX} 同步异常:`, err);
+      iconEl.textContent = '❌';
+      iconEl.style.animation = 'none';
+      titleEl.textContent = '同步出错';
+      descEl.textContent = `异常原因: ${err.message}`;
+      textEl.textContent = '同步失败';
+      actionsEl.style.display = 'flex';
+      if (debugContainer) debugContainer.style.display = 'block';
+    } finally {
+      // 最终，无论如何，都收集页面结构信息供调试，但仅在出错时在 UI 中展示
+      try {
+        const debugInfo = collectPageDebugInfo(activeCards, lastPreviewEl);
+        const debugText = JSON.stringify(debugInfo, null, 2);
+        const debugTextarea = document.getElementById('copilot-debug-text');
+        if (debugTextarea && debugContainer) {
+          debugTextarea.value = debugText;
+          
+          const copyBtn = document.getElementById('copilot-btn-copy-debug');
+          if (copyBtn) {
+            copyBtn.onclick = async () => {
+              try {
+                await navigator.clipboard.writeText(debugText);
+                copyBtn.textContent = '✅ 复制成功！请粘贴给 AI';
+                copyBtn.style.background = '#10b981';
+                setTimeout(() => {
+                  copyBtn.textContent = '📋 一键复制页面 HTML 信息 (发给 AI 修复)';
+                  copyBtn.style.background = '#6366f1';
+                }, 2000);
+              } catch (err) {
+                alert('复制失败，请手动全选文本框内容复制并发送给 AI！');
+              }
+            };
+          }
+        }
+      } catch (e) {
+        console.error('填充调试信息失败:', e);
+      }
+    }
+  }
+
+  /**
+   * 发送给 service worker
+   */
+  function sendToBackground(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          resolve(response);
+        }
+      });
+    });
+  }
+
+  // ============================================================
+  // 初始化
+  // ============================================================
+  function init() {
+    console.log(`${LOG_PREFIX} v${VERSION} 已加载`);
+    injectStyles();
+    createUI();
+  }
+
+  if (document.readyState === 'complete') {
+    setTimeout(init, 2000);
+  } else {
+    window.addEventListener('load', () => setTimeout(init, 2000));
+  }
+})();

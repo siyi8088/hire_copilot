@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=400, initial-scale=1.0">
+  <title>猎头 Copilot</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup-container">
+    <!-- 头部 -->
+    <header class="header">
+      <div class="logo-area">
+        <div class="logo-icon">🤖</div>
+        <div class="logo-text">
+          <h1>猎头 Copilot</h1>
+          <span class="version" id="versionText">v0.2.0</span>
+        </div>
+      </div>
+      <div id="connectionDot" class="connection-dot offline" title="后端未连接"></div>
+    </header>
+
+    <!-- 主开关 -->
+    <section class="control-section">
+      <div class="toggle-row">
+        <span class="toggle-label">自动回复</span>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggleEnabled">
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <p id="statusText" class="status-text">未启用</p>
+    </section>
+
+    <!-- 统计信息 -->
+    <section class="stats-section">
+      <h2 class="section-title">今日统计</h2>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-value" id="statReceived">0</div>
+          <div class="stat-label">收到消息</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statReplied">0</div>
+          <div class="stat-label">已回复</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statResumes">0</div>
+          <div class="stat-label">收到简历</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="statErrors">0</div>
+          <div class="stat-label">异常</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 主动打招呼 -->
+    <section class="greeting-section">
+      <div class="section-header-row">
+        <h2 class="section-title">主动打招呼</h2>
+        <div class="quota-badge" id="greetQuota">0/20</div>
+      </div>
+      <p id="greetStatus" class="status-text">今日未开始</p>
+      <button id="btnStartScan" class="btn btn-accent">
+        🔍 扫描推荐牛人
+      </button>
+    </section>
+
+    <!-- 运行时长 -->
+    <section class="runtime-section">
+      <div class="runtime-row">
+        <span>运行时长</span>
+        <span id="runtime">--:--:--</span>
+      </div>
+      <div class="runtime-row">
+        <span>当前聊天</span>
+        <span id="currentChat">无</span>
+      </div>
+    </section>
+
+    <!-- 操作按钮 -->
+    <section class="actions-section">
+      <button id="btnReconnect" class="btn btn-secondary" title="重新连接后端">
+        🔄 重连后端
+      </button>
+      <button id="btnOpenDashboard" class="btn btn-primary" title="打开管理面板">
+        📊 管理面板
+      </button>
+    </section>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
