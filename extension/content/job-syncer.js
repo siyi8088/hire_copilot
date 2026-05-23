@@ -12,6 +12,7 @@
   const VERSION = '0.2.0';
 
   let syncOverlay = null;
+  let panelDismissed = false;
 
   // ============================================================
   // UI 样式注入
@@ -23,42 +24,66 @@
     const style = document.createElement('style');
     style.id = styleId;
     style.textContent = `
-      /* 同步控制按钮 */
-      .copilot-sync-btn {
+      /* 同步控制面板 */
+      .copilot-sync-panel {
         position: fixed;
         bottom: 40px;
         right: 40px;
         z-index: 10000;
         background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-        color: #ffffff;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        padding: 10px 18px;
+        border: 1px solid rgba(255, 255, 255, 0.15);
         border-radius: 9999px;
+        box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
+        display: flex;
+        align-items: center;
+        padding: 2px;
+        backdrop-filter: blur(8px);
         font-family: 'Inter', system-ui, sans-serif;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      }
+
+      .copilot-sync-main-btn {
+        background: transparent;
+        color: #ffffff;
+        border: none;
+        padding: 8px 14px 8px 18px;
         font-size: 14px;
         font-weight: 600;
         cursor: pointer;
         display: flex;
         align-items: center;
         gap: 8px;
-        box-shadow: 0 4px 20px rgba(99, 102, 241, 0.4);
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        backdrop-filter: blur(8px);
+        border-radius: 9999px;
+        transition: opacity 0.2s;
       }
 
-      .copilot-sync-btn:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 24px rgba(99, 102, 241, 0.6);
-        background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+      .copilot-sync-main-btn:hover {
+        opacity: 0.9;
       }
 
-      .copilot-sync-btn:active {
-        transform: translateY(0);
-      }
-
-      .copilot-sync-btn .robot-icon {
+      .copilot-sync-main-btn .robot-icon {
         font-size: 16px;
         animation: pulse 2s infinite;
+      }
+
+      .copilot-sync-close-btn {
+        background: rgba(255, 255, 255, 0.15);
+        color: #ffffff;
+        border: none;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        font-size: 11px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        margin-right: 8px;
+        transition: background 0.2s;
+      }
+
+      .copilot-sync-close-btn:hover {
+        background: rgba(255, 255, 255, 0.3);
       }
 
       @keyframes pulse {
@@ -199,14 +224,19 @@
   // UI 元素创建
   // ============================================================
   function createUI() {
-    // 注入同步按钮
-    const btn = document.createElement('button');
-    btn.className = 'copilot-sync-btn';
-    btn.innerHTML = `
-      <span class="robot-icon">🤖</span>
-      <span>同步活跃岗位</span>
+    // 注入同步控制面板
+    const panel = document.createElement('div');
+    panel.className = 'copilot-sync-panel';
+    panel.id = 'copilot-sync-floating-panel';
+    panel.style.display = 'none'; // 由 checkRoute 控制显示
+    panel.innerHTML = `
+      <button class="copilot-sync-main-btn" id="copilot-btn-sync-trigger">
+        <span class="robot-icon">🤖</span>
+        <span>同步活跃岗位</span>
+      </button>
+      <button class="copilot-sync-close-btn" id="copilot-btn-sync-dismiss" title="关闭悬浮窗">✕</button>
     `;
-    document.body.appendChild(btn);
+    document.body.appendChild(panel);
 
     // 注入同步进度模态框
     const overlay = document.createElement('div');
@@ -236,7 +266,11 @@
     syncOverlay = overlay;
 
     // 绑定按钮事件
-    btn.addEventListener('click', startSyncFlow);
+    document.getElementById('copilot-btn-sync-trigger').addEventListener('click', startSyncFlow);
+    document.getElementById('copilot-btn-sync-dismiss').addEventListener('click', () => {
+      panelDismissed = true;
+      panel.style.display = 'none';
+    });
     document.getElementById('copilot-btn-close-sync').addEventListener('click', () => {
       overlay.classList.remove('active');
     });
@@ -1024,13 +1058,46 @@
     });
   }
 
+  let uiCreated = false;
+  let lastUrl = '';
+
+  function checkRoute() {
+    const currentUrl = window.location.href;
+    const isJobList = currentUrl.includes('/web/chat/job/list');
+
+    if (isJobList) {
+      if (!uiCreated) {
+        injectStyles();
+        createUI();
+        uiCreated = true;
+      }
+      const panel = document.getElementById('copilot-sync-floating-panel');
+      if (panel) {
+        panel.style.display = panelDismissed ? 'none' : 'flex';
+      }
+    } else {
+      const panel = document.getElementById('copilot-sync-floating-panel');
+      if (panel) {
+        panel.style.display = 'none';
+      }
+    }
+
+    // 检测到真实的 URL 切换时，重新恢复面板显示（以防用户再次进入职位管理页面需要使用）
+    if (currentUrl !== lastUrl) {
+      if (isJobList) {
+        panelDismissed = false;
+      }
+      lastUrl = currentUrl;
+    }
+  }
+
   // ============================================================
   // 初始化
   // ============================================================
   function init() {
     console.log(`${LOG_PREFIX} v${VERSION} 已加载`);
-    injectStyles();
-    createUI();
+    checkRoute();
+    setInterval(checkRoute, 1000);
   }
 
   if (document.readyState === 'complete') {

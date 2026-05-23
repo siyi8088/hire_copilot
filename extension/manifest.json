@@ -29,20 +29,17 @@
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://www.zhipin.com/web/chat/recommend*"],
+      "matches": [
+        "https://www.zhipin.com/web/chat/recommend*",
+        "https://www.zhipin.com/web/chat/job/list*"
+      ],
       "js": [
         "content/human-simulator.js",
-        "content/recommend-greeter.js"
+        "content/recommend-greeter.js",
+        "content/job-syncer.js"
       ],
       "css": [
         "content/recommend-panel.css"
-      ],
-      "run_at": "document_idle"
-    },
-    {
-      "matches": ["https://www.zhipin.com/web/chat/job/list*"],
-      "js": [
-        "content/job-syncer.js"
       ],
       "run_at": "document_idle"
     }

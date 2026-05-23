@@ -107,6 +107,7 @@
     },
     quota: { used: 0, limit: 20, remaining: 20 },
     panelElement: null,       // 审核面板 DOM 引用
+    panelDismissed: false,
   };
 
   // ============================================================
@@ -759,7 +760,8 @@
 
     // 绑定事件
     document.getElementById('crp-close-btn').addEventListener('click', () => {
-      panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+      panel.style.display = 'none';
+      state.panelDismissed = true;
     });
 
     document.getElementById('crp-scan-btn').addEventListener('click', startScanFlow);
@@ -1185,6 +1187,10 @@
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     switch (msg.type) {
       case 'START_GREETING_SCAN':
+        state.panelDismissed = false;
+        if (state.panelElement) {
+          state.panelElement.style.display = 'flex';
+        }
         startScanFlow().then(() => sendResponse({ ok: true }));
         return true;
 
@@ -1199,13 +1205,49 @@
 
       case 'TOGGLE_PANEL':
         if (state.panelElement) {
-          state.panelElement.style.display =
-            state.panelElement.style.display === 'none' ? 'flex' : 'none';
+          const isHidden = state.panelElement.style.display === 'none';
+          state.panelElement.style.display = isHidden ? 'flex' : 'none';
+          state.panelDismissed = !isHidden;
         }
         sendResponse({ ok: true });
         break;
     }
   });
+
+  // ============================================================
+  // 初始化
+  // ============================================================
+
+  let uiCreated = false;
+  let lastUrl = '';
+
+  function checkRoute() {
+    const currentUrl = window.location.href;
+    const isRecommend = currentUrl.includes('/web/chat/recommend');
+
+    if (isRecommend) {
+      if (!uiCreated) {
+        createReviewPanel();
+        updatePanelStatus('就绪 — 点击"扫描候选人"开始');
+        uiCreated = true;
+      }
+      if (state.panelElement) {
+        state.panelElement.style.display = state.panelDismissed ? 'none' : 'flex';
+      }
+    } else {
+      if (state.panelElement) {
+        state.panelElement.style.display = 'none';
+      }
+    }
+
+    // 检测到真实的 URL 切换时，重新恢复面板显示（以防用户再次进入推荐页面需要使用）
+    if (currentUrl !== lastUrl) {
+      if (isRecommend) {
+        state.panelDismissed = false;
+      }
+      lastUrl = currentUrl;
+    }
+  }
 
   // ============================================================
   // 初始化
@@ -1218,11 +1260,8 @@
     // 等待页面稳定
     await new Promise(resolve => setTimeout(resolve, 3000));
 
-    // 创建审核面板
-    createReviewPanel();
-    updatePanelStatus('就绪 — 点击"扫描候选人"开始');
-
-    console.log(`${LOG_PREFIX} 审核面板已注入`);
+    checkRoute();
+    setInterval(checkRoute, 1000);
   }
 
   if (document.readyState === 'complete') {
