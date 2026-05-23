@@ -1191,21 +1191,38 @@
         // 拟人化：等待弹窗渲染（0.8s - 1.5s）并自动确认职位关联或打招呼确认弹窗
         await sim.sleep(sim.clampedGaussian(1000, 200, 800, 1500));
         
-        const doc = greetBtn.ownerDocument || document;
-        const dialogs = doc.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"]');
+        // 收集所有可能的 document 对象（主文档、iframe 内部文档、以及 parent 文档）
+        const docs = [document];
+        if (window.parent && window.parent.document && window.parent.document !== document) {
+          docs.push(window.parent.document);
+        }
+        if (greetBtn.ownerDocument && !docs.includes(greetBtn.ownerDocument)) {
+          docs.push(greetBtn.ownerDocument);
+        }
+
+        let dialogs = [];
+        for (const docObj of docs) {
+          try {
+            const found = docObj.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"], [class*="recommend-filter-guide"]');
+            dialogs = dialogs.concat([...found]);
+          } catch (e) {
+            // 忽略由于跨域策略可能导致的错误
+          }
+        }
+
         let dialogClicked = false;
-        
         for (const dialog of dialogs) {
           const rect = dialog.getBoundingClientRect();
           // 只检查在屏幕上渲染可见的弹窗
           if (rect.width > 0 && rect.height > 0) {
             console.log(`${LOG_PREFIX} 检测到可见确认弹窗，尝试自动点击“确定/发送”按钮...`);
             
-            // 查找弹窗内的所有交互按钮
-            const buttons = dialog.querySelectorAll('button, a, span[class*="btn"], div[class*="btn"]');
+            // 查找弹窗内的所有交互按钮 (放宽元素标签和类名匹配，以防混淆类名)
+            const buttons = dialog.querySelectorAll('button, a, span, div, [class*="btn"], [class*="button"], [role="button"]');
             for (const btn of buttons) {
               const text = btn.textContent?.trim() || '';
               if (text === '确定' || text === '确认' || text === '发送' || text === '同意' || 
+                  text === '立即沟通' || text === '确认发送' ||
                   text.includes('确定') || text.includes('确认') || text.includes('发送')) {
                 btn.click();
                 console.log(`${LOG_PREFIX} ✅ 已自动确认弹窗: "${text}"`);
