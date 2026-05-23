@@ -923,8 +923,8 @@
     }
 
     try {
-      // 扫描页面
-      const candidates = await scrollAndScrape(40);
+      // 扫描页面，一次仅扫描 8 人（等于一个评估批次），显著提升响应速度避免超时
+      const candidates = await scrollAndScrape(8);
       state.scannedCandidates = candidates;
       state.stats.scanned = candidates.length;
 
