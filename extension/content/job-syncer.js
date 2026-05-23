@@ -26,8 +26,8 @@
       /* 同步控制按钮 */
       .copilot-sync-btn {
         position: fixed;
-        top: 20px;
-        right: 180px;
+        bottom: 40px;
+        right: 40px;
         z-index: 10000;
         background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
         color: #ffffff;
