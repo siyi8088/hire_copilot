@@ -23,15 +23,36 @@ async def get_db() -> aiosqlite.Connection:
 
 
 async def init_db():
-    """初始化数据库（建表）"""
-    schema_path = Path(__file__).parent / "schema.sql"
-    schema_sql = schema_path.read_text(encoding="utf-8")
-
+    """初始化数据库（建表与迁移）"""
     db = await get_db()
     try:
+        # 1. 安全迁移：如果旧表 greetings 存在，重命名为 recommendations
+        try:
+            cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='recommendations'")
+            rec_exists = await cursor.fetchone()
+            if not rec_exists:
+                cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='greetings'")
+                greet_exists = await cursor.fetchone()
+                if greet_exists:
+                    await db.execute("ALTER TABLE greetings RENAME TO recommendations")
+                    print("[DB] 旧表 greetings 成功重命名为 recommendations")
+        except Exception as e:
+            print(f"[DB] 重命名旧表失败（或已迁移）: {e}")
+
+        # 2. 执行 schema.sql 创建新表和索引
+        schema_path = Path(__file__).parent / "schema.sql"
+        schema_sql = schema_path.read_text(encoding="utf-8")
         await db.executescript(schema_sql)
         
-        # 动态添加每日统计的新列，以容纳扫描候选人统计数据
+        # 3. 动态添加列
+        # 3.1 recommendations 添加 candidate_id 关联列
+        try:
+            await db.execute("ALTER TABLE recommendations ADD COLUMN candidate_id INTEGER REFERENCES candidates(id)")
+            print("[DB] 动态为 recommendations 添加 candidate_id 关联列")
+        except Exception:
+            pass
+
+        # 3.2 daily_stats 添加每日扫描和匹配列
         try:
             await db.execute("ALTER TABLE daily_stats ADD COLUMN candidates_scanned INTEGER DEFAULT 0")
         except Exception:
@@ -42,7 +63,7 @@ async def init_db():
             pass
 
         await db.commit()
-        print("[DB] 数据库初始化完成")
+        print("[DB] 数据库初始化/迁移完成")
     finally:
         await db.close()
 
@@ -146,12 +167,13 @@ async def increment_daily_stat(field: str, amount: int = 1):
 
 
 # ============================================================
-# 主动打招呼 — 数据库操作
+# 智能推荐与主动打招呼 — 数据库操作
 # ============================================================
 
 async def save_greeting(candidate_data: dict, match_score: float,
-                        match_reason: str, followup_text: str,
-                        job_post_id: int | None = None) -> dict:
+                         match_reason: str, followup_text: str,
+                         job_post_id: int | None = None,
+                         status: str = 'pending') -> dict:
     """保存待打招呼候选人记录"""
     import json
 
@@ -159,13 +181,13 @@ async def save_greeting(candidate_data: dict, match_score: float,
     try:
         tags_json = json.dumps(candidate_data.get("tags", []), ensure_ascii=False)
         await db.execute(
-            """INSERT INTO greetings
+            """INSERT INTO recommendations
                (candidate_name, candidate_title, candidate_company,
                 candidate_experience, candidate_education, candidate_salary,
                 candidate_tags, candidate_job_status, candidate_advantage,
                 candidate_work_history, match_score, match_reason,
                 followup_text, job_post_id, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 candidate_data.get("name", ""),
                 candidate_data.get("title", ""),
@@ -181,6 +203,7 @@ async def save_greeting(candidate_data: dict, match_score: float,
                 match_reason,
                 followup_text,
                 job_post_id,
+                status,
             ),
         )
         await db.commit()
@@ -190,7 +213,7 @@ async def save_greeting(candidate_data: dict, match_score: float,
         row = await cursor.fetchone()
         greeting_id = row[0]
 
-        cursor = await db.execute("SELECT * FROM greetings WHERE id = ?", (greeting_id,))
+        cursor = await db.execute("SELECT * FROM recommendations WHERE id = ?", (greeting_id,))
         row = await cursor.fetchone()
         return dict(row)
     finally:
@@ -212,8 +235,21 @@ async def update_greeting_status(greeting_id: int, status: str,
 
         params.append(greeting_id)
         await db.execute(
-            f"UPDATE greetings SET {', '.join(sets)} WHERE id = ?",
+            f"UPDATE recommendations SET {', '.join(sets)} WHERE id = ?",
             params,
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def link_recommendation_to_candidate(recommendation_id: int, candidate_id: int):
+    """绑定评估记录与聊天候选人记录"""
+    db = await get_db()
+    try:
+        await db.execute(
+            "UPDATE recommendations SET candidate_id = ? WHERE id = ?",
+            (candidate_id, recommendation_id),
         )
         await db.commit()
     finally:
@@ -228,7 +264,7 @@ async def get_today_greeting_count() -> int:
     db = await get_db()
     try:
         cursor = await db.execute(
-            """SELECT COUNT(*) FROM greetings
+            """SELECT COUNT(*) FROM recommendations
                WHERE status IN ('sent', 'followed_up', 'replied')
                AND DATE(sent_at) = ?""",
             (today,),
@@ -245,14 +281,14 @@ async def get_pending_greetings(job_post_id: int | None = None) -> list:
     try:
         if job_post_id:
             cursor = await db.execute(
-                """SELECT * FROM greetings
+                """SELECT * FROM recommendations
                    WHERE status = 'approved' AND job_post_id = ?
                    ORDER BY match_score DESC""",
                 (job_post_id,),
             )
         else:
             cursor = await db.execute(
-                """SELECT * FROM greetings
+                """SELECT * FROM recommendations
                    WHERE status = 'approved'
                    ORDER BY match_score DESC"""
             )
@@ -262,16 +298,47 @@ async def get_pending_greetings(job_post_id: int | None = None) -> list:
         await db.close()
 
 
-async def get_greeting_history(limit: int = 50) -> list:
-    """获取打招呼历史"""
+async def get_greeting_history(limit: int = 50, status_filter: str = 'sent') -> list:
+    """获取推荐和打招呼历史记录，支持状态过滤以及已过滤候选人的2天留存"""
     db = await get_db()
     try:
-        cursor = await db.execute(
-            """SELECT * FROM greetings
-               WHERE status != 'pending'
-               ORDER BY created_at DESC LIMIT ?""",
-            (limit,),
-        )
+        if status_filter == 'all':
+            query = """
+                SELECT * FROM recommendations
+                WHERE status != 'filtered' OR created_at >= datetime('now', '-2 days', 'localtime')
+                ORDER BY created_at DESC LIMIT ?
+            """
+            params = (limit,)
+        elif status_filter == 'sent':
+            query = """
+                SELECT * FROM recommendations
+                WHERE status IN ('sent', 'followed_up', 'replied')
+                ORDER BY created_at DESC LIMIT ?
+            """
+            params = (limit,)
+        elif status_filter == 'pending':
+            query = """
+                SELECT * FROM recommendations
+                WHERE status = 'pending'
+                ORDER BY created_at DESC LIMIT ?
+            """
+            params = (limit,)
+        elif status_filter == 'filtered':
+            query = """
+                SELECT * FROM recommendations
+                WHERE status = 'filtered' AND created_at >= datetime('now', '-2 days', 'localtime')
+                ORDER BY created_at DESC LIMIT ?
+            """
+            params = (limit,)
+        else:
+            query = """
+                SELECT * FROM recommendations
+                WHERE status != 'filtered' OR created_at >= datetime('now', '-2 days', 'localtime')
+                ORDER BY created_at DESC LIMIT ?
+            """
+            params = (limit,)
+
+        cursor = await db.execute(query, params)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -291,7 +358,7 @@ async def get_greeting_stats() -> dict:
                 COUNT(CASE WHEN status IN ('sent','followed_up','replied') THEN 1 END) as sent,
                 COUNT(CASE WHEN status IN ('followed_up','replied') THEN 1 END) as followed_up,
                 COUNT(CASE WHEN status = 'replied' THEN 1 END) as replied
-               FROM greetings WHERE DATE(sent_at) = ?""",
+               FROM recommendations WHERE DATE(sent_at) = ?""",
             (today,),
         )
         today_row = await cursor.fetchone()
@@ -302,7 +369,7 @@ async def get_greeting_stats() -> dict:
                 COUNT(CASE WHEN status IN ('sent','followed_up','replied') THEN 1 END) as total_sent,
                 COUNT(CASE WHEN status IN ('followed_up','replied') THEN 1 END) as total_followed_up,
                 COUNT(CASE WHEN status = 'replied' THEN 1 END) as total_replied
-               FROM greetings"""
+               FROM recommendations"""
         )
         total_row = await cursor.fetchone()
 
@@ -348,9 +415,9 @@ async def check_candidate_greeted(candidate_name: str, candidate_title: str) -> 
     db = await get_db()
     try:
         cursor = await db.execute(
-            """SELECT COUNT(*) FROM greetings
+            """SELECT COUNT(*) FROM recommendations
                WHERE candidate_name = ? AND candidate_title = ?
-               AND status != 'pending'""",
+               AND status IN ('sent', 'followed_up', 'replied', 'approved')""",
             (candidate_name, candidate_title),
         )
         row = await cursor.fetchone()

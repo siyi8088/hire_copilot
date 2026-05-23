@@ -54,9 +54,10 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     greetings_replied INTEGER DEFAULT 0
 );
 
--- 主动打招呼记录表
-CREATE TABLE IF NOT EXISTS greetings (
+-- 智能推荐与打招呼记录表
+CREATE TABLE IF NOT EXISTS recommendations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER,            -- 关联 candidates(id)
     candidate_name TEXT,
     candidate_title TEXT,            -- 当前职位
     candidate_company TEXT,          -- 最近公司
@@ -71,12 +72,13 @@ CREATE TABLE IF NOT EXISTS greetings (
     match_reason TEXT,               -- 匹配理由
     greeting_text TEXT,              -- 预设招呼语（记录发了什么）
     followup_text TEXT,              -- 跟进消息内容
-    status TEXT DEFAULT 'pending',   -- pending / approved / sent / followed_up / replied / ignored
+    status TEXT DEFAULT 'pending',   -- filtered / pending / approved / sent / followed_up / replied / ignored
     job_post_id INTEGER,
     sent_at TIMESTAMP,
     followup_at TIMESTAMP,
     replied_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (candidate_id) REFERENCES candidates(id),
     FOREIGN KEY (job_post_id) REFERENCES job_posts(id)
 );
 
@@ -85,5 +87,5 @@ CREATE INDEX IF NOT EXISTS idx_candidates_chat_id ON candidates(boss_chat_id);
 CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
 CREATE INDEX IF NOT EXISTS idx_messages_candidate ON messages(candidate_id);
 CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date);
-CREATE INDEX IF NOT EXISTS idx_greetings_status ON greetings(status);
-CREATE INDEX IF NOT EXISTS idx_greetings_sent_at ON greetings(sent_at);
+CREATE INDEX IF NOT EXISTS idx_recommendations_status ON recommendations(status);
+CREATE INDEX IF NOT EXISTS idx_recommendations_sent_at ON recommendations(sent_at);

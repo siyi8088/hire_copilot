@@ -286,9 +286,16 @@ async def create_job(job_data: dict):
 # ============================================================
 
 @app.get("/api/greetings")
-async def get_greetings(limit: int = 50):
+async def get_greetings(limit: int = 50, status: str = 'sent'):
     """获取打招呼历史"""
-    history = await get_greeting_history(limit)
+    history = await get_greeting_history(limit, status_filter=status)
+    return {"greetings": history}
+
+
+@app.get("/api/recommendations")
+async def get_recommendations(limit: int = 50, status: str = 'sent'):
+    """获取打招呼和评估历史（推荐路径）"""
+    history = await get_greeting_history(limit, status_filter=status)
     return {"greetings": history}
 
 
@@ -304,6 +311,27 @@ async def get_greetings_stats():
     """获取打招呼效果统计"""
     stats = await get_greeting_stats()
     return {"stats": stats}
+
+
+@app.get("/api/candidates/{candidate_id}/messages")
+async def get_candidate_messages(candidate_id: int):
+    """拉取候选人的对话记录气泡数据"""
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT role, content, created_at FROM messages
+               WHERE candidate_id = ?
+               ORDER BY created_at ASC""",
+            (candidate_id,)
+        )
+        rows = await cursor.fetchall()
+        messages = [dict(row) for row in rows]
+        return {"messages": messages}
+    except Exception as e:
+        logger.error(f"获取对话历史失败: {e}")
+        return {"messages": [], "error": str(e)}
+    finally:
+        await db.close()
 
 
 # ============================================================
@@ -910,6 +938,113 @@ async def dashboard():
                     padding: 16px;
                 }
             }
+
+            /* 页签 Tabs 样式 */
+            .crp-tabs-container {
+                display: flex;
+                justify-content: flex-start;
+                align-items: center;
+                gap: 8px;
+                margin-top: 16px;
+                margin-bottom: 8px;
+                border-bottom: 1px solid var(--border-color);
+                padding-bottom: 12px;
+            }
+
+            .crp-tab-btn {
+                background: transparent;
+                border: 1px solid transparent;
+                color: var(--text-secondary);
+                padding: 6px 16px;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+                position: relative;
+            }
+
+            .crp-tab-btn:hover {
+                color: var(--text-primary);
+                background: rgba(255, 255, 255, 0.03);
+            }
+
+            .crp-tab-btn.active {
+                color: #ffffff;
+                background: var(--color-primary-glow);
+                border-color: rgba(99, 102, 241, 0.3);
+                font-weight: 600;
+                box-shadow: 0 4px 12px rgba(99, 102, 241, 0.1);
+            }
+
+            /* 已过滤状态标签样式 */
+            .status-filtered {
+                background: rgba(244, 63, 94, 0.1);
+                border: 1px solid rgba(244, 63, 94, 0.2);
+                color: #fda4af;
+            }
+
+            /* 详情弹窗中实时跟进对话历史样式 */
+            .chat-history-section {
+                border-top: 1px solid var(--border-color);
+                padding-top: 16px;
+                margin-top: 8px;
+                display: none; /* 默认隐藏，有 candidate_id 时显示 */
+            }
+
+            .chat-history-title {
+                font-size: 13px;
+                font-weight: 600;
+                color: var(--text-primary);
+                margin-bottom: 12px;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            .chat-bubble-container {
+                max-height: 240px;
+                overflow-y: auto;
+                background: rgba(0, 0, 0, 0.2);
+                border: 1px solid var(--border-color);
+                border-radius: 12px;
+                padding: 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+
+            .chat-bubble {
+                max-width: 85%;
+                padding: 10px 14px;
+                border-radius: 12px;
+                font-size: 13px;
+                line-height: 1.45;
+                position: relative;
+            }
+
+            .chat-bubble.copilot {
+                background: var(--color-primary-glow);
+                border: 1px solid rgba(99, 102, 241, 0.25);
+                color: #e0e7ff;
+                align-self: flex-end;
+                border-bottom-right-radius: 2px;
+            }
+
+            .chat-bubble.candidate {
+                background: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                color: #f1f1f6;
+                align-self: flex-start;
+                border-bottom-left-radius: 2px;
+            }
+
+            .chat-bubble-time {
+                font-size: 10px;
+                color: rgba(255, 255, 255, 0.3);
+                margin-top: 4px;
+                text-align: right;
+            }
         </style>
     </head>
     <body>
@@ -1030,7 +1165,12 @@ async def dashboard():
                             <h2 class="section-title">
                                 <span>👥</span>
                                 <span>主动打招呼及跟进记录</span>
-                            </h2>
+                        </div>
+                        <div class="crp-tabs-container">
+                            <button class="crp-tab-btn active" id="tabBtn-all" onclick="switchGreetingTab('all')">全部历史</button>
+                            <button class="crp-tab-btn" id="tabBtn-sent" onclick="switchGreetingTab('sent')">已发送/沟通</button>
+                            <button class="crp-tab-btn" id="tabBtn-pending" onclick="switchGreetingTab('pending')">待打招呼</button>
+                            <button class="crp-tab-btn" id="tabBtn-filtered" onclick="switchGreetingTab('filtered')">已被过滤</button>
                         </div>
                         <div class="table-container">
                             <table>
@@ -1197,6 +1337,12 @@ async def dashboard():
                         <div class="info-block-title">已发/预设跟进消息</div>
                         <div id="modalFollowup" style="font-style: italic; color: #a5b4fc;">-</div>
                     </div>
+                    <div class="chat-history-section" id="modalChatHistorySection">
+                        <div class="chat-history-title">💬 沟通跟进对话历史</div>
+                        <div class="chat-bubble-container" id="modalChatBubbleContainer">
+                            <!-- 对话气泡动态生成 -->
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1215,7 +1361,7 @@ async def dashboard():
             // Modal controller
             let activeGreetingsList = [];
             
-            function showCandidateModal(index) {
+            async function showCandidateModal(index) {
                 const item = activeGreetingsList[index];
                 if (!item) return;
 
@@ -1230,6 +1376,46 @@ async def dashboard():
                 
                 document.getElementById('modalReason').textContent = item.match_reason || '无评估理由';
                 document.getElementById('modalFollowup').textContent = item.followup_text ? `"${item.followup_text}"` : '未发送或无跟进消息';
+
+                // 实时对话记录展示
+                const chatSection = document.getElementById('modalChatHistorySection');
+                const bubbleContainer = document.getElementById('modalChatBubbleContainer');
+                
+                if (item.candidate_id) {
+                    chatSection.style.display = 'block';
+                    bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--text-secondary); padding: 12px;">正在加载实时对话记录...</div>';
+                    
+                    try {
+                        const res = await fetch(`/api/candidates/${item.candidate_id}/messages`);
+                        const data = await res.json();
+                        const messages = data.messages || [];
+                        
+                        if (messages.length === 0) {
+                            bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--text-secondary); padding: 12px;">暂无对话消息记录</div>';
+                        } else {
+                            bubbleContainer.innerHTML = messages.map(msg => {
+                                const bubbleClass = msg.role === 'copilot' ? 'copilot' : 'candidate';
+                                const roleLabel = msg.role === 'copilot' ? 'Copilot 助手' : item.candidate_name;
+                                return `
+                                    <div class="chat-bubble ${bubbleClass}">
+                                        <div style="font-weight: 600; font-size: 11px; margin-bottom: 2px;">${roleLabel}</div>
+                                        <div>${msg.content}</div>
+                                        <div class="chat-bubble-time">${formatTime(msg.created_at)}</div>
+                                    </div>
+                                `;
+                            }).join('');
+                            // 滚动到底部
+                            setTimeout(() => {
+                                bubbleContainer.scrollTop = bubbleContainer.scrollHeight;
+                            }, 50);
+                        }
+                    } catch (e) {
+                        console.error("Failed to load chat history: ", e);
+                        bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--color-error); padding: 12px;">加载失败，请检查后端服务</div>';
+                    }
+                } else {
+                    chatSection.style.display = 'none';
+                }
 
                 document.getElementById('candidateModal').style.display = 'flex';
             }
@@ -1249,9 +1435,10 @@ async def dashboard():
             // Helper for badges
             function getStatusBadge(status) {
                 const statusLabels = {
-                    'pending': '待评估',
-                    'approved': '已批准',
-                    'sent': '已打招呼',
+                    'filtered': '已被过滤',
+                    'pending': '待打招呼',
+                    'approved': '已审核',
+                    'sent': '已发招呼',
                     'followed_up': '已发跟进',
                     'replied': '已回复',
                     'ignored': '已略过'
@@ -1382,14 +1569,46 @@ async def dashboard():
                     document.getElementById('totalBarReplied').style.width = totalBarRepliedWidth + '%';
 
                     // 4. Fetch Greetings History
-                    const greetRes = await fetch('/api/greetings?limit=15');
+                    await refreshGreetingsHistory();
+
+                } catch(e) {
+                    console.error("Dashboard refresh error: ", e);
+                }
+            }
+
+            let currentActiveTab = 'all';
+
+            async function switchGreetingTab(status) {
+                currentActiveTab = status;
+                
+                // Update active tab buttons visual state
+                const buttons = document.querySelectorAll('.crp-tab-btn');
+                buttons.forEach(btn => {
+                    if (btn.id === `tabBtn-${status}`) {
+                        btn.classList.add('active');
+                    } else {
+                        btn.classList.remove('active');
+                    }
+                });
+                
+                // Set loading status in table body
+                const tbody = document.getElementById('greetingsTableBody');
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">加载中...</td></tr>';
+                
+                // Immediately refresh greetings history
+                await refreshGreetingsHistory();
+            }
+
+            async function refreshGreetingsHistory() {
+                try {
+                    const greetRes = await fetch(`/api/greetings?limit=30&status=${currentActiveTab}`);
                     const greetData = await greetRes.json();
                     const list = greetData.greetings || [];
                     activeGreetingsList = list;
 
                     const tbody = document.getElementById('greetingsTableBody');
                     if (list.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">暂无主动打招呼历史</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">暂无该状态下的历史记录</td></tr>';
                     } else {
                         tbody.innerHTML = list.map((item, index) => {
                             const subInfo = item.candidate_company ? `${item.candidate_title} | ${item.candidate_company}` : item.candidate_title;
@@ -1414,9 +1633,8 @@ async def dashboard():
                             `;
                         }).join('');
                     }
-
-                } catch(e) {
-                    console.error("Dashboard refresh error: ", e);
+                } catch (e) {
+                    console.error("Failed to load greetings history: ", e);
                 }
             }
 

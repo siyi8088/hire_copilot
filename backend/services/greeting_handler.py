@@ -112,7 +112,8 @@ async def evaluate_candidates(candidates: list[dict], job_title: str | None = No
             c["followupText"] = followup
             await asyncio.sleep(0.5)
 
-    # 6. 保存到数据库（状态为 pending，等待用户确认）
+    # 6. 保存到数据库
+    # 6.1 保存合格的（状态为 pending，等待用户确认）
     for c in qualified:
         saved = await save_greeting(
             candidate_data=c,
@@ -120,8 +121,20 @@ async def evaluate_candidates(candidates: list[dict], job_title: str | None = No
             match_reason=c["matchReason"],
             followup_text=c.get("followupText", ""),
             job_post_id=job_info.get("id"),
+            status='pending',
         )
         c["greetingId"] = saved["id"]
+
+    # 6.2 保存已过滤的（状态为 filtered，仅归档展示）
+    for c in filtered:
+        await save_greeting(
+            candidate_data=c,
+            match_score=c["matchScore"],
+            match_reason=c["matchReason"],
+            followup_text="",
+            job_post_id=job_info.get("id"),
+            status='filtered',
+        )
 
     # 7. 记录每日扫描和匹配的统计指标
     await increment_daily_stat("candidates_scanned", len(fresh_candidates))

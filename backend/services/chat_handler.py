@@ -66,34 +66,46 @@ async def handle_incoming_message(
         finally:
             await db.close()
 
-    # 2.2 联动打招呼逻辑：若有姓名，检查是否有状态为 sent 或 followed_up 的打招呼记录，将其置为 replied
+    # 2.2 联动打招呼与推荐逻辑：若有姓名，绑定 recommendation 与 candidate 记录，并联动更新回复状态
     if candidate_name:
         db = await get_db()
         try:
-            # 找到该名字最新一条打过招呼且未标记回复的记录
+            # 1. 查找此候选人最新的推荐/打招呼记录 (未绑定过 candidate_id 优先)
             cursor = await db.execute(
-                """SELECT id FROM greetings
-                   WHERE candidate_name = ? AND status IN ('sent', 'followed_up')
-                   ORDER BY created_at DESC LIMIT 1""",
+                """SELECT id, status FROM recommendations
+                   WHERE candidate_name = ?
+                   ORDER BY (CASE WHEN candidate_id IS NULL THEN 1 ELSE 0 END) DESC, created_at DESC LIMIT 1""",
                 (candidate_name,),
             )
             row = await cursor.fetchone()
             if row:
-                greeting_id = row[0]
+                rec_id, status = row[0], row[1]
+                # 绑定 candidate_id
                 await db.execute(
-                    """UPDATE greetings
-                       SET status = 'replied', replied_at = CURRENT_TIMESTAMP
-                       WHERE id = ?""",
-                    (greeting_id,),
+                    "UPDATE recommendations SET candidate_id = ? WHERE id = ?",
+                    (candidate_id, rec_id),
                 )
-                await db.commit()
-                # 同时也增加 greetings_replied 统计
-                await increment_daily_stat("greetings_replied")
-                logger.info(
-                    f"🎉 候选人回复联动！打招呼记录 id={greeting_id} (姓名={candidate_name}) 状态更新为 replied"
-                )
+                
+                # 2. 如果之前是已发送状态，候选人发来消息，说明回复了，更新为 replied
+                if status in ('sent', 'followed_up'):
+                    await db.execute(
+                        """UPDATE recommendations
+                           SET status = 'replied', replied_at = CURRENT_TIMESTAMP
+                           WHERE id = ?""",
+                        (rec_id,),
+                    )
+                    await db.commit()
+                    await increment_daily_stat("greetings_replied")
+                    logger.info(
+                        f"🎉 候选人回复联动！推荐记录 id={rec_id} (姓名={candidate_name}) 状态更新为 replied 并绑定 candidate_id={candidate_id}"
+                    )
+                else:
+                    await db.commit()
+                    logger.info(
+                        f"🔗 候选人信息关联成功！推荐记录 id={rec_id} (姓名={candidate_name}) 已绑定 candidate_id={candidate_id}"
+                    )
         except Exception as e:
-            logger.error(f"更新打招呼状态失败: {e}")
+            logger.error(f"关联推荐/打招呼记录失败: {e}")
         finally:
             await db.close()
 
