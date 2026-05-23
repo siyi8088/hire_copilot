@@ -277,6 +277,18 @@
       if (candidate.name === '未知' && !candidate.salary) continue;
       if (seen.has(candidate.fingerprint)) continue;
 
+      // 过滤已经打过招呼/沟通中的候选人，避免重新扫描时重复评估
+      const btnText = candidate._greetButton?.textContent?.trim() || '';
+      const isAlreadyGreeted = btnText.includes('继续') || 
+                               btnText.includes('聊过') || 
+                               btnText.includes('发消息') || 
+                               btnText.includes('已') ||
+                               (!btnText.includes('打招呼') && !btnText.includes('聊一聊') && !btnText.includes('沟通') && btnText.length > 0);
+      if (isAlreadyGreeted) {
+        console.log(`${LOG_PREFIX} 自动过滤已打招呼/已沟通的候选人: ${candidate.name} (${btnText})`);
+        continue;
+      }
+
       seen.add(candidate.fingerprint);
       candidates.push(candidate);
     }
@@ -1080,9 +1092,15 @@
           continue;
         }
 
-        // 检查按钮是否可点击
-        if (greetBtn.disabled || greetBtn.classList.contains('disabled')) {
-          console.warn(`${LOG_PREFIX} ${candidate.name} 的打招呼按钮不可用，可能已打过`);
+        // 检查按钮是否可点击及是否已经打过招呼
+        const btnText = greetBtn.textContent?.trim() || '';
+        const isAlreadyGreeted = btnText.includes('继续') || 
+                                 btnText.includes('聊过') || 
+                                 btnText.includes('发消息') || 
+                                 btnText.includes('已') ||
+                                 (!btnText.includes('打招呼') && !btnText.includes('聊一聊') && !btnText.includes('沟通') && btnText.length > 0);
+        if (greetBtn.disabled || greetBtn.classList.contains('disabled') || isAlreadyGreeted) {
+          console.warn(`${LOG_PREFIX} ${candidate.name} 的打招呼按钮不可用或已沟通，跳过 (文案: ${btnText})`);
           continue;
         }
 
