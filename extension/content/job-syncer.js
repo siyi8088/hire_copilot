@@ -25,6 +25,16 @@
     return val || [];
   }
 
+  function logToBackend(msg) {
+    console.log(LOG_PREFIX, msg);
+    try {
+      sendToBackground({
+        type: 'DEBUG_LOG',
+        log: msg
+      });
+    } catch (e) {}
+  }
+
   // ============================================================
   // UI 样式注入
   // ============================================================
@@ -340,10 +350,12 @@
    */
   function findActiveJobCards() {
     const cardSelectors = SEL('JOB_CARD');
+    logToBackend(`JOB_CARD selectors: ${JSON.stringify(cardSelectors)}`);
 
     let cardElements = [];
     for (const sel of cardSelectors) {
       const els = findAllElements(sel);
+      logToBackend(`Selector [${sel}] found ${els.length} elements`);
       if (els.length > 0) {
         cardElements = els;
         break;
@@ -352,6 +364,7 @@
 
     // 兜底方案：通过“编辑”和“开放中”特征查找行卡片
     if (cardElements.length === 0) {
+      logToBackend("常规选择器均未找到卡片，启动兜底扫描...");
       const allDivs = findAllElements('div, li');
       const seen = new Set();
       for (const el of allDivs) {
@@ -374,12 +387,24 @@
           }
         }
       }
+      logToBackend(`兜底扫描找到 ${cardElements.length} 个卡片`);
     }
 
-    // 过滤出状态为“开放中”的岗位
+    // 过滤出状态为“开放中”的岗位（包含“开放中”或包含“关闭”操作按钮的，且不包含“打开”操作按钮的）
+    logToBackend(`开始对 ${cardElements.length} 个岗位候选元素进行状态过滤...`);
+    cardElements.forEach((el, index) => {
+      logToBackend(`[卡片 #${index}] text content: "${el.textContent?.replace(/\s+/g, ' ').trim()}"`);
+    });
+
     const activeCards = cardElements.filter(el => {
       const text = el.textContent || '';
-      return text.includes('开放中');
+      const matched = (text.includes('开放中') || text.includes('关闭')) && !text.includes('打开');
+      return matched;
+    });
+
+    logToBackend(`过滤完成。活跃岗位卡片数: ${activeCards.length}`);
+    activeCards.forEach((el, index) => {
+      logToBackend(`[活跃岗 #${index}] text content: "${el.textContent?.replace(/\s+/g, ' ').trim()}"`);
     });
 
     console.log(`${LOG_PREFIX} 共找到 ${cardElements.length} 个岗位，其中活跃岗 ${activeCards.length} 个`);
@@ -390,9 +415,27 @@
    * 打开岗位的详情弹窗/抽屉
    */
   async function openJobPreview(cardEl) {
-    // 1. 尝试通过“三个点 ➔ 预览”的交互链，打开“静态预览弹窗”（此方式速度最快，且不涉及SPA页面跳转或表单输入）
+    // 1. 尝试在 cardEl 里直接查找“预览”选项并点击（部分改版或布局可能直接显示）
     try {
-      // 优先精确定位三个点图标/按钮，并发起 mouseenter / mouseover 事件，模拟悬停以防有悬浮处理
+      const operateItemSels = SEL('OPERATE_MENU_ITEM');
+      const previewItems = operateItemSels.flatMap(sel => [...cardEl.querySelectorAll(sel)]);
+      const previewItem = previewItems.find(el => el.textContent?.trim() === '预览');
+      if (previewItem) {
+        logToBackend(`在卡片内直接找到“预览”项，触发点击: "${previewItem.outerHTML.slice(0, 100)}"`);
+        previewItem.click();
+        await new Promise(r => setTimeout(r, 1000));
+        const previewEl = findPreviewContainer();
+        if (previewEl) {
+          logToBackend(`✅ 成功开启静态预览容器`);
+          return true;
+        }
+      }
+    } catch (e) {
+      logToBackend(`卡片内直接查找“预览”出错: ${e.message}`);
+    }
+
+    // 2. 模拟悬停与点击“三个点”按钮以激活/展开操作菜单
+    try {
       const moreBtnCandidates = SEL('MORE_OPERATE_BTN');
       let moreBtn = null;
       for (const sel of moreBtnCandidates) {
@@ -400,79 +443,91 @@
         if (moreBtn) break;
       }
       if (moreBtn) {
-        console.log(`${LOG_PREFIX} 模拟悬停与点击三个点按钮以激活状态...`);
+        logToBackend(`模拟悬停与点击三个点按钮: "${moreBtn.outerHTML.slice(0, 100)}"`);
         moreBtn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
         moreBtn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         moreBtn.click();
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise(r => setTimeout(r, 500)); // 等待下拉菜单展开与渲染
+      } else {
+        logToBackend(`卡片内未找到三个点按钮`);
       }
+    } catch (e) {
+      logToBackend(`点击三个点按钮出错: ${e.message}`);
+    }
 
-      // 无论下拉菜单当前在 CSS 中是否可见，HTML 结构显示下拉项已经在 cardEl DOM 内。
-      // 直接定位 cardEl 内部文本为“预览”的元素并进行点击。
-      const operateItemSels = SEL('OPERATE_MENU_ITEM');
-      const previewItems = operateItemSels.flatMap(sel => [...cardEl.querySelectorAll(sel)]);
-      const previewItem = previewItems.find(el => el.textContent?.trim() === '预览');
+    // 3. 在全局范围内模糊查找所有包含“预览”文本且【当前可见】的选项进行点击
+    logToBackend(`尝试在全局查找可见的“预览”选项进行点击...`);
+    try {
+      // 搜集全局的所有可能是操作菜单项或按钮/链接 of elements
+      const globalCandidates = findAllElements('.job-operate-item, li, a, span, button');
+      logToBackend(`全局找到 ${globalCandidates.length} 个候选交互元素`);
+      // 过滤：文本为“预览”，且真正可见的元素
+      const visiblePreviewItem = globalCandidates.find(el => {
+        if (el.textContent?.trim() !== '预览') return false;
+        try {
+          const rect = el.getBoundingClientRect();
+          if (rect.width === 0 || rect.height === 0) return false;
+          
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+          
+          // 向上检查所有父级，确保没有隐藏
+          let parent = el.parentElement;
+          while (parent && parent !== document.body) {
+            const pStyle = window.getComputedStyle(parent);
+            if (pStyle.display === 'none' || pStyle.visibility === 'hidden') return false;
+            parent = parent.parentElement;
+          }
+          return true;
+        } catch (err) {
+          return true;
+        }
+      });
 
-      if (previewItem) {
-        console.log(`${LOG_PREFIX} 成功定位到“预览”项，直接触发点击:`, previewItem);
-        previewItem.click();
-        await new Promise(r => setTimeout(r, 1500)); // 等待预览面板完全渲染
-        
-        // 验证是否已成功弹出预览容器
+      if (visiblePreviewItem) {
+        logToBackend(`找到全局可见的“预览”选项，触发点击: "${visiblePreviewItem.outerHTML.slice(0, 100)}"`);
+        visiblePreviewItem.click();
+        await new Promise(r => setTimeout(r, 1200));
         const previewEl = findPreviewContainer();
         if (previewEl) {
-          console.log(`${LOG_PREFIX} ✅ 成功开启静态预览容器`);
-          return;
+          logToBackend(`✅ 通过全局可见“预览”项成功开启静态预览容器`);
+          return true;
         }
       } else {
-        console.warn(`${LOG_PREFIX} 未能在岗位卡片中找到“预览”项`);
+        logToBackend(`全局中未找到任何可见且文本等于“预览”的元素！`);
       }
     } catch (e) {
-      console.warn(`${LOG_PREFIX} 尝试“三个点 ➔ 预览”交互失败:`, e);
+      logToBackend(`全局查找可见“预览”点击失败: ${e.message}`);
     }
 
-    // 2. 降级方案：在全局 (包含 Iframe) 中模糊查找所有包含“预览”文本的项尝试点击
-    console.log(`${LOG_PREFIX} 降级：在全局查找“预览”选项进行点击...`);
+    // 4. 寻找卡片内是否有直接暴露出来的“预览”或“详情”字样按钮，但绝不点击标题/卡片整行
+    logToBackend(`尝试在卡片中查找直接暴露的预览/查看详情按钮...`);
     try {
-      const globalItems = findAllElements('.job-operate-item, li, a, span');
-      const previewItem = globalItems.find(el => el.textContent?.trim() === '预览');
-      if (previewItem) {
-        console.log(`${LOG_PREFIX} 找到全局“预览”项，尝试点击:`, previewItem);
-        previewItem.click();
-        await new Promise(r => setTimeout(r, 1500));
+      const actionElements = [...cardEl.querySelectorAll('button, a, span, div')];
+      const previewBtn = actionElements.find(el => {
+        const txt = el.textContent?.trim() || '';
+        return (txt === '预览' || txt === '详情' || txt.includes('查看详情') || txt.includes('岗位详情')) && 
+               el.tagName !== 'A' && el.getBoundingClientRect().width > 0;
+      });
+
+      if (previewBtn) {
+        logToBackend(`找到卡片直接预览按钮并点击: "${previewBtn.outerHTML.slice(0, 100)}"`);
+        previewBtn.click();
+        await new Promise(r => setTimeout(r, 1200));
         const previewEl = findPreviewContainer();
         if (previewEl) {
-          console.log(`${LOG_PREFIX} ✅ 通过全局预览项成功开启静态预览容器`);
-          return;
+          logToBackend(`✅ 通过直接预览按钮成功开启静态预览容器`);
+          return true;
         }
+      } else {
+        logToBackend(`卡片内未找到直接暴露的预览/详情按钮`);
       }
     } catch (e) {
-      console.warn(`${LOG_PREFIX} 降级全局预览点击失败:`, e);
+      logToBackend(`卡片内直接暴露的按钮查找点击失败: ${e.message}`);
     }
 
-    // 3. 降级方案：寻找卡片内是否有直接暴露出来的“预览”或“详情”字样按钮，但绝不直接点击卡片/标题（防止页面跳转到编辑页）
-    console.log(`${LOG_PREFIX} 尝试在卡片中查找直接暴露的预览/查看详情按钮`);
-    const actionElements = [...cardEl.querySelectorAll('button, a, span, div')];
-    const previewBtn = actionElements.find(el => {
-      const txt = el.textContent?.trim() || '';
-      // 精确匹配，且不应该是标题链接或卡片自身
-      return (txt === '预览' || txt === '详情' || txt.includes('查看详情') || txt.includes('岗位详情')) && 
-             el.tagName !== 'A' && el.getBoundingClientRect().width > 0;
-    });
-
-    if (previewBtn) {
-      console.log(`${LOG_PREFIX} 找到直接预览按钮并点击:`, previewBtn);
-      previewBtn.click();
-      await new Promise(r => setTimeout(r, 1500));
-      const previewEl = findPreviewContainer();
-      if (previewEl) {
-        console.log(`${LOG_PREFIX} ✅ 通过直接预览按钮成功开启静态预览容器`);
-        return;
-      }
-    }
-
-    // 如果以上都失败，抛出错误，中止同步流程，防止进入编辑页面
-    throw new Error('无法通过“三个点 ➔ 预览”打开该职位的详情弹窗，已阻止页面跳转到编辑页以保护数据。');
+    logToBackend(`❌ 无法成功打开该岗位卡片的预览窗口！`);
+    return false;
   }
 
   /**
@@ -583,7 +638,14 @@
                !text.includes('职位要求') && 
                !text.includes('工作地点') && 
                !text.includes('招聘类型') && 
-               !text.includes('职位名称');
+               !text.includes('职位名称') &&
+               !text.includes('提示') &&
+               !text.includes('保存') &&
+               !text.includes('发布') &&
+               !text.includes('删除') &&
+               !text.includes('关闭') &&
+               !text.includes('取消') &&
+               !text.includes('编辑');
       });
       if (validTitleEl) {
         title = validTitleEl.textContent.trim();
@@ -592,6 +654,23 @@
     
     // 清洗格式
     title = title.replace(/代招|匿名/g, '').trim();
+    
+    // 校验解析出的标题是否与期望目标一致，不一致则使用 fallback 期望值（排除 DOM 过渡残留标题干扰）
+    const cleanStr = (s) => (s || '').replace(/代招|匿名|普|营|竞|官/g, '')
+                            .replace(/\d+[-~]\d+[Kk万]/g, '')
+                            .replace(/\d+薪/g, '')
+                            .replace(/[_|｜\-]/g, '')
+                            .replace(/\s+/g, '')
+                            .toLowerCase();
+    if (title && fallbackData.title) {
+      const parsedNorm = cleanStr(title);
+      const fallbackNorm = cleanStr(fallbackData.title);
+      if (parsedNorm && fallbackNorm && !parsedNorm.includes(fallbackNorm) && !fallbackNorm.includes(parsedNorm)) {
+        console.warn(`${LOG_PREFIX} 解析到的职位名称 [${title}] 与目标岗位 [${fallbackData.title}] 不匹配，降级采用目标职位名称。`);
+        title = fallbackData.title;
+      }
+    }
+
     if (!title && fallbackData.title) {
       title = fallbackData.title;
     }
@@ -748,28 +827,40 @@
    */
   async function closeJobPreview(previewEl) {
     if (!previewEl) return;
-    const closeBtnCandidates = SEL('PREVIEW_CLOSE_BTN');
+    
+    // 寻找包含关闭按钮的祖先容器（例如抽屉 wrapper、弹窗 wrapper 等）
+    let container = previewEl;
+    let current = previewEl;
+    while (current && current.tagName !== 'BODY') {
+      const hasClose = current.querySelector('button[class*="close"], span[class*="close"], a[class*="close"], [class*="icon-close"], .close');
+      if (hasClose) {
+        container = current;
+        break;
+      }
+      current = current.parentElement;
+    }
+    
     let closeBtn = null;
+    const closeBtnCandidates = SEL('PREVIEW_CLOSE_BTN');
     for (const sel of closeBtnCandidates) {
-      closeBtn = previewEl.querySelector(sel);
+      closeBtn = container.querySelector(sel);
       if (closeBtn) break;
     }
     if (closeBtn) {
-      console.log(`${LOG_PREFIX} 点击关闭按钮`);
+      logToBackend(`找到关闭按钮并点击: "${closeBtn.outerHTML.slice(0, 100)}"`);
       closeBtn.click();
     } else {
-      // 查找包含 ✕ 或“关闭”、“取消”字样的按钮元素进行关闭
-      const spans = previewEl.querySelectorAll('span, button, a');
+      // 兜底策略：在 container 里找带关闭字样的元素（必须是精确匹配，不能模糊匹配以防点到“关闭职位”危险按钮）
+      const spans = container.querySelectorAll('span, button, a, i');
       const xBtn = [...spans].find(el => {
         const txt = el.textContent?.trim() || '';
-        return txt === '✕' || txt === '✕ 关闭' || txt.includes('关闭') || txt.includes('取消');
+        return txt === '✕' || txt === '✕ 关闭' || txt === '关闭' || txt === '取消' || txt === '关闭窗口' || el.className?.includes('close');
       });
       if (xBtn) {
-        console.log(`${LOG_PREFIX} 找到带关闭特征的按钮并点击:`, xBtn);
+        logToBackend(`找到带关闭特征的按钮并点击: "${xBtn.outerHTML.slice(0, 100)}"`);
         xBtn.click();
       } else {
-        console.warn(`${LOG_PREFIX} 未能识别到关闭按钮，尝试点击遮罩层或空白区域兜底`);
-        // 尝试点击 previewEl 的外部以触发自收起
+        logToBackend(`[警告] 未能识别到关闭按钮，尝试点击遮罩层或空白区域兜底`);
         document.body.click();
       }
     }
@@ -777,7 +868,7 @@
   }
 
   /**
-   * 收集页面 HTML 结构进行调试，用于针对性分析选择器
+   * 收集页面 HTML structure 进行调试，用于针对性分析选择器
    */
   function collectPageDebugInfo(activeCards, previewEl) {
     const info = {
@@ -820,6 +911,77 @@
     }
 
     return info;
+  }
+
+  /**
+   * 等待详情预览窗口中的职位名称加载匹配目标岗位
+   */
+  async function waitForPreviewToLoad(previewEl, targetTitle, maxWaitMs = 3000) {
+    const startTime = Date.now();
+    const cleanStr = (s) => (s || '').replace(/代招|匿名|普|营|竞|官/g, '')
+                            .replace(/\d+[-~]\d+[Kk万]/g, '')
+                            .replace(/\d+薪/g, '')
+                            .replace(/[_|｜\-]/g, '')
+                            .replace(/\s+/g, '')
+                            .toLowerCase();
+                             
+    const targetNorm = cleanStr(targetTitle);
+    logToBackend(`[waitForPreviewToLoad] 开始载入校验。targetTitle: "${targetTitle}", targetNorm: "${targetNorm}"`);
+    
+    while (Date.now() - startTime < maxWaitMs) {
+      let title = '';
+      const titleInput = previewEl.querySelector('input[name="jobName"], input.job-name-input');
+      if (titleInput && titleInput.value) {
+        title = titleInput.value.trim();
+        logToBackend(`[waitForPreviewToLoad] 找到 titleInput.value: "${title}"`);
+      }
+      if (!title) {
+        const titleEls = [...previewEl.querySelectorAll('h1, h2, h3, [class*="title"], [class*="name"]')];
+        const validTitleEl = titleEls.find(el => {
+          const text = el.textContent || '';
+          return text.length > 0 && text.length < 50 && 
+                 !text.includes('基本信息') && 
+                 !text.includes('无法修改') && 
+                 !text.includes('客户公司') && 
+                 !text.includes('职位描述') && 
+                 !text.includes('职位要求') && 
+                 !text.includes('工作地点') && 
+                 !text.includes('招聘类型') && 
+                 !text.includes('职位名称') &&
+                 !text.includes('提示') &&
+                 !text.includes('保存') &&
+                 !text.includes('发布') &&
+                 !text.includes('删除') &&
+                 !text.includes('关闭') &&
+                 !text.includes('取消') &&
+                 !text.includes('编辑');
+        });
+        if (validTitleEl) {
+          title = validTitleEl.textContent.trim();
+          logToBackend(`[waitForPreviewToLoad] 从 titleEls 匹配到首个 validTitleEl: "${title}"`);
+        } else {
+          // 打印前 5 个候选 titleEls textContent
+          const candidates = titleEls.slice(0, 5).map(el => `${el.tagName}: "${el.textContent?.trim()}"`).join(', ');
+          logToBackend(`[waitForPreviewToLoad] 未找到有效 validTitleEl。候选列表: [${candidates}]`);
+        }
+      }
+      
+      const titleNorm = cleanStr(title);
+      const pageTextNorm = cleanStr(previewEl.textContent);
+      logToBackend(`[waitForPreviewToLoad] titleNorm: "${titleNorm}", pageTextNorm 长度: ${pageTextNorm.length}`);
+      
+      // 双重策略验证：如果解析的标题名归一化匹配，或者整个预览容器的文本中包含了目标岗位的归一化名称，均视为加载成功
+      if ((titleNorm && (titleNorm.includes(targetNorm) || targetNorm.includes(titleNorm))) || 
+          (pageTextNorm && pageTextNorm.includes(targetNorm))) {
+        logToBackend(`[waitForPreviewToLoad] ✅ 校验通过！`);
+        console.log(`${LOG_PREFIX} ✅ 预览窗口已成功加载/匹配到目标岗位: ${targetTitle}`);
+        return true;
+      }
+      
+      await new Promise(r => setTimeout(r, 200));
+    }
+    logToBackend(`[waitForPreviewToLoad] ❌ 校验超时，匹配失败！`);
+    return false;
   }
 
   /**
@@ -908,6 +1070,14 @@
       }
 
       descEl.innerHTML = `检测到以下活跃岗位：<br><strong style="color: #6366f1; display: block; margin: 10px 0; font-size: 15px;">${jobTitles.join('、')}</strong>正在同步中，请勿关闭或刷新此页面。`;
+      textEl.textContent = `正在重置云端岗位激活状态...`;
+      try {
+        await sendToBackground({
+          type: 'DEACTIVATE_ALL_JOBS'
+        });
+      } catch (e) {
+        console.warn(`${LOG_PREFIX} 重置激活状态失败 (后端可能未更新):`, e);
+      }
       textEl.textContent = `共发现 ${activeCards.length} 个活跃岗位，开始同步...`;
 
       let successCount = 0;
@@ -916,19 +1086,36 @@
       for (let i = 0; i < activeCards.length; i++) {
         const card = activeCards[i];
         const fallbackData = cardDatas[i] || {};
+        logToBackend(`开始同步第 ${i + 1}/${activeCards.length} 个活跃岗位: "${fallbackData.title}"`);
         
         // 滚动到该卡片
         card.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await new Promise(r => setTimeout(r, 500));
 
-        // 尝试打开预览
+        // 尝试打开预览，引入加载等待与重试机制以规避Boss直聘DOM更新竞态
         textEl.textContent = `正在展开第 ${i + 1}/${activeCards.length} 个岗位...`;
-        await openJobPreview(card);
+        let previewEl = null;
+        let loadSuccess = false;
+        
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          logToBackend(`第 ${attempt} 次尝试打开预览...`);
+          const opened = await openJobPreview(card);
+          logToBackend(`openJobPreview 返回结果: ${opened}`);
+          previewEl = findPreviewContainer();
+          logToBackend(`findPreviewContainer 返回结果: ${previewEl ? '已找到' : '未找到'}`);
+          if (previewEl) {
+            logToBackend(`等待预览内容加载，目标岗位: "${fallbackData.title}"...`);
+            loadSuccess = await waitForPreviewToLoad(previewEl, fallbackData.title);
+            logToBackend(`waitForPreviewToLoad 返回结果: ${loadSuccess}`);
+            if (loadSuccess) break;
+          }
+          console.warn(`${LOG_PREFIX} 第 ${attempt} 次打开/加载岗位 [${fallbackData.title}] 预览未就绪，重试中...`);
+          await new Promise(r => setTimeout(r, 800));
+        }
 
-        // 尝试获取预览窗口
-        const previewEl = findPreviewContainer();
-        if (!previewEl) {
-          console.warn(`${LOG_PREFIX} 未找到岗位详情预览容器`);
+        if (!previewEl || !loadSuccess) {
+          logToBackend(`[警告] 无法正确打开或加载岗位 [${fallbackData.title}] 的详情，跳过该岗位！`);
+          console.warn(`${LOG_PREFIX} 无法正确打开或加载岗位 [${fallbackData.title}] 的详情，跳过该岗位。`);
           continue;
         }
         lastPreviewEl = previewEl;

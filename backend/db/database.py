@@ -12,6 +12,31 @@ from config import settings
 DB_PATH = settings.DB_PATH
 
 
+def normalize_job_title(title: str) -> str:
+    import re
+    if not title:
+        return ""
+    title = title.lower()
+    # Remove salary range patterns like "20-40K", "20-25K", etc.
+    title = re.sub(r'\d+[-~]\d+[Kk万]', '', title)
+    # Remove 15薪/13薪 patterns
+    title = re.sub(r'\d+薪', '', title)
+    # Remove separators and extra words
+    title = re.sub(r'[_|｜\-]', ' ', title)
+    title = title.replace("代招", "").replace("匿名", "")
+    # Remove extra spaces
+    title = re.sub(r'\s+', ' ', title).strip()
+    return title
+
+
+def is_skeleton_job(description: str, salary_range: str) -> bool:
+    desc = description or ""
+    sal = salary_range or ""
+    return ("自动创建" in desc or "建议去职位管理" in desc or "暂无职位描述" in desc or 
+            "自动创建" in sal or "建议去职位管理" in sal or not desc or desc.strip() == "")
+
+
+
 async def get_db() -> aiosqlite.Connection:
     """获取数据库连接"""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -717,7 +742,7 @@ async def check_candidate_greeted(candidate_name: str, candidate_title: str) -> 
 
 
 async def save_or_update_job_post(job_data: dict) -> dict:
-    """保存或更新岗位配置，并设为活跃，其它岗位设为非活跃"""
+    """保存或更新岗位配置，并设为活跃"""
     title = job_data.get("title", "").strip()
     if not title:
         raise ValueError("Job title cannot be empty")
@@ -730,23 +755,34 @@ async def save_or_update_job_post(job_data: dict) -> dict:
     
     db = await get_db()
     try:
-        # Check if job with this title already exists
+        # 1. 尝试精确查找标题完全一致的记录
         cursor = await db.execute("SELECT id FROM job_posts WHERE title = ?", (title,))
         row = await cursor.fetchone()
         
+        job_id = None
         if row:
             job_id = row["id"]
-            # Update existing job and make it active
-            await db.execute("UPDATE job_posts SET is_active = 0")
+        else:
+            # 2. 如果没找到，尝试在数据库中寻找同名的 skeleton 岗位（即 normalization 相同且是 skeleton）
+            cursor = await db.execute("SELECT * FROM job_posts")
+            all_jobs = await cursor.fetchall()
+            for j in all_jobs:
+                db_title = j["title"]
+                if (normalize_job_title(db_title) == normalize_job_title(title) and 
+                    is_skeleton_job(j["description"], j["salary_range"])):
+                    job_id = j["id"]
+                    break
+        
+        if job_id:
+            # 更新已有岗位，并设为 active
             await db.execute(
                 """UPDATE job_posts 
-                   SET company = ?, description = ?, salary_range = ?, requirements = ?, highlights = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP
+                   SET title = ?, company = ?, description = ?, salary_range = ?, requirements = ?, highlights = ?, is_active = 1, updated_at = CURRENT_TIMESTAMP
                    WHERE id = ?""",
-                (company, description, salary_range, requirements, highlights, job_id)
+                (title, company, description, salary_range, requirements, highlights, job_id)
             )
         else:
-            # Insert new job and make it active
-            await db.execute("UPDATE job_posts SET is_active = 0")
+            # 插入新岗位，设为 active
             cursor = await db.execute(
                 """INSERT INTO job_posts (title, company, description, salary_range, requirements, highlights, is_active)
                    VALUES (?, ?, ?, ?, ?, ?, 1)""",
@@ -763,6 +799,7 @@ async def save_or_update_job_post(job_data: dict) -> dict:
         await db.close()
 
 
+
 async def sync_active_job_post_by_title(job_title: str) -> dict:
     """
     根据推荐页面的职位名称来识别并激活数据库中的岗位。
@@ -777,34 +814,47 @@ async def sync_active_job_post_by_title(job_title: str) -> dict:
     
     db = await get_db()
     try:
-        # 1. 精确匹配标题
-        cursor = await db.execute("SELECT * FROM job_posts WHERE title = ?", (core_title,))
-        row = await cursor.fetchone()
+        # 使用归一化的标题比对，在所有现有岗位中查找匹配项
+        cursor = await db.execute("SELECT * FROM job_posts")
+        all_rows = await cursor.fetchall()
         
-        # 2. 如果没匹配到，尝试模糊匹配（如 title 包含在 core_title 中，或者 core_title 包含在 title 中）
-        if not row:
-            cursor = await db.execute("SELECT * FROM job_posts")
-            all_rows = await cursor.fetchall()
-            for r in all_rows:
-                db_title = r["title"]
-                if db_title in core_title or core_title in db_title:
-                    row = r
-                    break
-        
-        if row:
-            job_id = row["id"]
-            # 将该岗位设为活跃，其它岗位设为非活跃
-            await db.execute("UPDATE job_posts SET is_active = 0")
+        matches = []
+        for r in all_rows:
+            db_title = r["title"]
+            db_norm = normalize_job_title(db_title)
+            core_norm = normalize_job_title(core_title)
+            
+            # 归一化后一致，或核心词相互包含，记为候选匹配
+            if db_norm == core_norm or core_norm in db_norm or db_norm in core_norm:
+                matches.append(dict(r))
+                
+        job_id = None
+        if matches:
+            # 排序机制优先级：
+            # 1. 优先非占位 skeleton 岗位（非 skeleton 的 is_skel 为 0，skeleton 为 1）
+            # 2. 优先归一化名称完全一致的岗位
+            # 3. 优先最近更新的岗位
+            def match_key(item):
+                is_skel = is_skeleton_job(item.get("description"), item.get("salary_range"))
+                exact_title = (normalize_job_title(item.get("title")) == normalize_job_title(core_title))
+                return (1 if is_skel else 0, 0 if exact_title else 1, item.get("updated_at") or "")
+            
+            matches.sort(key=match_key)
+            best_match = matches[0]
+            job_id = best_match["id"]
+            
+            # 将该岗位设为活跃（不影响其他岗位的活跃状态）
             await db.execute("UPDATE job_posts SET is_active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (job_id,))
             await db.commit()
         else:
             # 3. 如果依然未找到，说明可能是一个全新的职位，直接自动创建并激活它
             company = parts[1] if len(parts) > 1 else ""
             salary_range = parts[2] if len(parts) > 2 else ""
-            await db.execute("UPDATE job_posts SET is_active = 0")
+            
+            # 修正插入错位（title => core_title, company => company, description => placeholder, salary_range => salary_range）
             cursor = await db.execute(
                 """INSERT INTO job_posts (title, company, description, salary_range, requirements, highlights, is_active)
-                   VALUES (?, ?, ?, '自动创建的岗位，建议去职位管理页面同步完整 JD', '自动提取的要求', '自动提取的亮点', 1)""",
+                   VALUES (?, ?, '自动创建的岗位，建议去职位管理页面同步完整 JD', ?, '自动提取的要求', '自动提取的亮点', 1)""",
                 (core_title, company, salary_range)
             )
             job_id = cursor.lastrowid
@@ -815,6 +865,7 @@ async def sync_active_job_post_by_title(job_title: str) -> dict:
         return dict(row)
     finally:
         await db.close()
+
 
 
 

@@ -133,6 +133,8 @@ window.SelectorRegistry = (() => {
         // 预览容器内关闭按钮
         PREVIEW_CLOSE_BTN: {
           candidates: [
+            '[class*="close-btn"]',
+            '[class*="close"]',
             'button[class*="close"]',
             'span[class*="close"]',
             'a[class*="close"]',

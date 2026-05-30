@@ -184,6 +184,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // 异步 sendResponse
   }
 
+  // ---- 调试日志打印 ----
+  if (msg.type === 'DEBUG_LOG') {
+    sendToBackend({
+      type: 'DEBUG_LOG',
+      log: msg.log,
+    })
+      .then(() => {
+        sendResponse({ ok: true });
+      })
+      .catch(err => {
+        sendResponse({ ok: false, error: err.message });
+      });
+    return true;
+  }
+
+  // ---- 主动打招呼：反激活所有岗位 ----
+  if (msg.type === 'DEACTIVATE_ALL_JOBS') {
+    sendToBackend({
+      type: 'DEACTIVATE_ALL_JOBS',
+    })
+      .then(response => {
+        sendResponse({ ok: response.ok, error: response.error });
+      })
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 反激活岗位失败:`, err);
+        sendResponse({ ok: false, error: err.message });
+      });
+
+    return true;
+  }
+
   // ---- 主动打招呼：同步保存岗位 ----
   if (msg.type === 'SAVE_JOB_POST') {
     sendToBackend({

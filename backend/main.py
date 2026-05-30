@@ -108,6 +108,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
+            # 调试日志打印
+            if message.get("type") == "DEBUG_LOG":
+                logger.info(f"🔮 [DEBUG_LOG] {message.get('log')}")
+                continue
+
             # 处理聊天消息
             if message.get("type") == "CHAT_MESSAGE":
                 request_id = message.get("requestId")
@@ -150,6 +155,34 @@ async def websocket_endpoint(websocket: WebSocket):
                     "filtered_count": result.get("filtered_count", 0),
                     "error": result.get("error"),
                 })
+                continue
+
+            # ---- 主动打招呼：反激活所有岗位（在同步前调用） ----
+            if message.get("type") == "DEACTIVATE_ALL_JOBS":
+                request_id = message.get("requestId")
+                logger.info("📋 收到反激活所有岗位请求")
+                try:
+                    from db.database import get_db
+                    db = await get_db()
+                    try:
+                        await db.execute("UPDATE job_posts SET is_active = 0")
+                        await db.commit()
+                    finally:
+                        await db.close()
+                        
+                    await websocket.send_json({
+                        "requestId": request_id,
+                        "type": "DEACTIVATE_ALL_JOBS_RESULT",
+                        "ok": True,
+                    })
+                except Exception as e:
+                    logger.error(f"反激活岗位失败: {e}")
+                    await websocket.send_json({
+                        "requestId": request_id,
+                        "type": "DEACTIVATE_ALL_JOBS_RESULT",
+                        "ok": False,
+                        "error": str(e),
+                    })
                 continue
 
             # ---- 主动打招呼：保存/同步岗位 ----
@@ -500,9 +533,20 @@ async def get_status():
 
 @app.get("/api/job")
 async def get_current_job():
-    """获取当前活跃岗位"""
-    job = await get_active_job_post()
-    return {"job": job}
+    """获取当前活跃的岗位列表和首个活跃岗位"""
+    from db.database import get_db
+    db = await get_db()
+    try:
+        cursor = await db.execute("SELECT * FROM job_posts WHERE is_active = 1 ORDER BY updated_at DESC")
+        rows = await cursor.fetchall()
+        jobs = [dict(r) for r in rows]
+        return {
+            "job": jobs[0] if jobs else None,
+            "jobs": jobs
+        }
+    finally:
+        await db.close()
+
 
 
 @app.post("/api/job")
@@ -534,8 +578,9 @@ async def create_job(job_data: dict):
 # REST API — 主动打招呼
 # ============================================================
 
+
 @app.get("/api/greetings")
-async def get_greetings(page: int = 1, limit: int = 15, status: str = 'sent'):
+async def get_greetings(page: int = 1, limit: int = 10, status: str = 'sent'):
     """获取打招呼历史"""
     from db.database import get_greeting_history_paginated
     result = await get_greeting_history_paginated(page=page, limit=limit, status_filter=status)
@@ -543,7 +588,7 @@ async def get_greetings(page: int = 1, limit: int = 15, status: str = 'sent'):
 
 
 @app.get("/api/recommendations")
-async def get_recommendations(page: int = 1, limit: int = 15, status: str = 'sent'):
+async def get_recommendations(page: int = 1, limit: int = 10, status: str = 'sent'):
     """获取打招呼和评估历史（推荐路径）"""
     from db.database import get_greeting_history_paginated
     result = await get_greeting_history_paginated(page=page, limit=limit, status_filter=status)
@@ -1796,12 +1841,7 @@ async def dashboard():
                                     </div>
                                 </div>
 
-                                <div class="job-label">岗位亮点</div>
-                                <div class="job-value">
-                                    <div class="job-highlight-list" id="jobHighlights">
-                                        <!-- Highlights -->
-                                    </div>
-                                </div>
+
                             </div>
                         </div>
                     </div>
@@ -2074,10 +2114,164 @@ async def dashboard():
                     el.style.display = 'block';
                 }
             }
-
             // Modal controller
             let activeGreetingsList = [];
-            
+            let activeJobsList = [];
+            let currentJobPage = 1;
+            const jobPageSize = 2;
+
+            function renderActiveJobs() {
+                const container = document.getElementById('jobDetailsContainer');
+                if (!container) return;
+                container.innerHTML = '';
+
+                if (activeJobsList.length === 0) {
+                    container.innerHTML = `
+                        <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                            <div>未激活岗位</div>
+                            <div style="font-size: 12px; margin-top: 8px;">请先前往“职位管理”页面同步岗位</div>
+                        </div>
+                    `;
+                    return;
+                }
+
+                const totalPages = Math.ceil(activeJobsList.length / jobPageSize);
+                if (currentJobPage > totalPages) {
+                    currentJobPage = Math.max(1, totalPages);
+                }
+
+                const startIdx = (currentJobPage - 1) * jobPageSize;
+                const endIdx = startIdx + jobPageSize;
+                const visibleJobs = activeJobsList.slice(startIdx, endIdx);
+
+                visibleJobs.forEach((job, idx) => {
+                    const jobGrid = document.createElement('div');
+                    jobGrid.className = 'job-detail-grid';
+                    if (idx > 0) {
+                        jobGrid.style.borderTop = '1px dashed rgba(255, 255, 255, 0.1)';
+                        jobGrid.style.paddingTop = '16px';
+                        jobGrid.style.marginTop = '16px';
+                    }
+
+                    // 1. 岗位名称
+                    const titleLabel = document.createElement('div');
+                    titleLabel.className = 'job-label';
+                    titleLabel.textContent = '岗位名称';
+                    const titleValue = document.createElement('div');
+                    titleValue.className = 'job-value';
+                    titleValue.style.fontWeight = '600';
+                    titleValue.textContent = job.title;
+                    jobGrid.appendChild(titleLabel);
+                    jobGrid.appendChild(titleValue);
+
+                    // 2. 发布公司
+                    const companyLabel = document.createElement('div');
+                    companyLabel.className = 'job-label';
+                    companyLabel.textContent = '发布公司';
+                    const companyValue = document.createElement('div');
+                    companyValue.className = 'job-value';
+                    companyValue.textContent = job.company || '自营招聘';
+                    jobGrid.appendChild(companyLabel);
+                    jobGrid.appendChild(companyValue);
+
+                    // 3. 薪资范围
+                    const salaryLabel = document.createElement('div');
+                    salaryLabel.className = 'job-label';
+                    salaryLabel.textContent = '薪资范围';
+                    const salaryValue = document.createElement('div');
+                    salaryValue.className = 'job-value';
+                    salaryValue.style.color = 'var(--color-cyan)';
+                    salaryValue.style.fontWeight = '600';
+                    salaryValue.textContent = job.salary_range || '未设薪资';
+                    jobGrid.appendChild(salaryLabel);
+                    jobGrid.appendChild(salaryValue);
+
+                    // 4. 职责描述
+                    const descLabel = document.createElement('div');
+                    descLabel.className = 'job-label';
+                    descLabel.textContent = '职责描述';
+                    const descValue = document.createElement('div');
+                    descValue.className = 'job-value';
+                    
+                    const descContainer = document.createElement('div');
+                    descContainer.className = 'hover-tooltip-container';
+                    const descTrigger = document.createElement('span');
+                    descTrigger.className = 'hover-tooltip-trigger';
+                    descTrigger.textContent = '查看完整 JD 职责描述 ➔';
+                    const descCard = document.createElement('div');
+                    descCard.className = 'hover-tooltip-card';
+                    descCard.textContent = job.description || '无详细描述';
+                    
+                    descContainer.appendChild(descTrigger);
+                    descContainer.appendChild(descCard);
+                    descValue.appendChild(descContainer);
+                    jobGrid.appendChild(descLabel);
+                    jobGrid.appendChild(descValue);
+
+                    // 5. 任职要求
+                    const reqLabel = document.createElement('div');
+                    reqLabel.className = 'job-label';
+                    reqLabel.textContent = '任职要求';
+                    const reqValue = document.createElement('div');
+                    reqValue.className = 'job-value';
+                    
+                    const reqContainer = document.createElement('div');
+                    reqContainer.className = 'hover-tooltip-container';
+                    const reqTrigger = document.createElement('span');
+                    reqTrigger.className = 'hover-tooltip-trigger';
+                    reqTrigger.textContent = '查看完整任职要求 ➔';
+                    const reqCard = document.createElement('div');
+                    reqCard.className = 'hover-tooltip-card';
+                    reqCard.textContent = job.requirements || '无任职要求';
+                    
+                    reqContainer.appendChild(reqTrigger);
+                    reqContainer.appendChild(reqCard);
+                    reqValue.appendChild(reqContainer);
+                    jobGrid.appendChild(reqLabel);
+                    jobGrid.appendChild(reqValue);
+
+                    container.appendChild(jobGrid);
+                });
+
+                if (activeJobsList.length > jobPageSize) {
+                    const paginationDiv = document.createElement('div');
+                    paginationDiv.className = 'pagination-container';
+                    paginationDiv.style.marginTop = '16px';
+                    paginationDiv.style.paddingTop = '12px';
+
+                    const infoSpan = document.createElement('div');
+                    infoSpan.className = 'pagination-info';
+                    infoSpan.textContent = `共 ${activeJobsList.length} 个岗位，当前第 ${currentJobPage} / ${totalPages} 页`;
+
+                    const btnGroup = document.createElement('div');
+                    btnGroup.className = 'pagination-buttons';
+
+                    const btnPrev = document.createElement('button');
+                    btnPrev.className = 'page-btn';
+                    btnPrev.textContent = '◀ 上一页';
+                    btnPrev.disabled = (currentJobPage <= 1);
+                    btnPrev.onclick = () => {
+                        currentJobPage--;
+                        renderActiveJobs();
+                    };
+
+                    const btnNext = document.createElement('button');
+                    btnNext.className = 'page-btn';
+                    btnNext.textContent = '下一页 ▶';
+                    btnNext.disabled = (currentJobPage >= totalPages);
+                    btnNext.onclick = () => {
+                        currentJobPage++;
+                        renderActiveJobs();
+                    };
+
+                    btnGroup.appendChild(btnPrev);
+                    btnGroup.appendChild(btnNext);
+                    paginationDiv.appendChild(infoSpan);
+                    paginationDiv.appendChild(btnGroup);
+                    container.appendChild(paginationDiv);
+                }
+            }
+
             async function showCandidateModal(index) {
                 const item = activeGreetingsList[index];
                 if (!item) return;
@@ -2208,33 +2402,19 @@ async def dashboard():
                     
                     document.getElementById('debugState').textContent = JSON.stringify(statusData, null, 2);
 
-                    // 2. Fetch Active Job Details
                     const jobRes = await fetch('/api/job');
                     const jobData = await jobRes.json();
-                    if (jobData && jobData.job) {
-                        document.getElementById('jobTitle').textContent = jobData.job.title;
-                        document.getElementById('jobCompany').textContent = jobData.job.company || '自营招聘';
-                        document.getElementById('jobSalary').textContent = jobData.job.salary_range || '未设薪资';
-                        document.getElementById('jobDescCard').textContent = jobData.job.description || '无详细描述';
-                        document.getElementById('jobReqCard').textContent = jobData.job.requirements || '无任职要求';
-                        
-                        const highlights = jobData.job.highlights || '';
-                        const hlContainer = document.getElementById('jobHighlights');
-                        hlContainer.innerHTML = '';
-                        highlights.split(/[,，;|]/).filter(h => h.trim()).forEach(hl => {
-                            const tag = document.createElement('span');
-                            tag.className = 'job-highlight-tag';
-                            tag.textContent = hl.trim();
-                            hlContainer.appendChild(tag);
-                        });
-                    } else {
-                        document.getElementById('jobTitle').textContent = '未激活岗位';
-                        document.getElementById('jobCompany').textContent = '-';
-                        document.getElementById('jobSalary').textContent = '-';
-                        document.getElementById('jobDescCard').textContent = '请先前往职位管理同步岗位';
-                        document.getElementById('jobReqCard').textContent = '请先前往职位管理同步岗位';
-                        document.getElementById('jobHighlights').innerHTML = '<span style="color: var(--text-secondary);">请先在主应用配置活跃职位</span>';
+                    activeJobsList = jobData.jobs || [];
+
+                    const activeCount = activeJobsList.length;
+                    const badge = document.querySelector('.section-card .job-badge');
+                    if (badge) {
+                        badge.textContent = activeCount > 0 ? `运行中 (${activeCount})` : '未激活';
+                        badge.style.background = activeCount > 0 ? 'var(--color-primary-glow)' : 'rgba(255, 255, 255, 0.05)';
                     }
+
+                    renderActiveJobs();
+
 
                     // 3. Fetch Funnel Metrics
                     const statsRes = await fetch('/api/greetings/stats');
@@ -2323,7 +2503,7 @@ async def dashboard():
             let currentActiveTab = 'all';
             let greetingCurrentPage = 1;
             let greetingTotalPages = 1;
-            const greetingPageLimit = 15;
+            const greetingPageLimit = 10;
 
             async function switchGreetingTab(status) {
                 currentActiveTab = status;
