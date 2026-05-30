@@ -52,6 +52,19 @@ window.ChatInteractor = (() => {
     ],
   };
 
+  const MODULE_NAME = 'chatObserver';
+
+  function SEL(name) {
+    if (window.PreflightCheck) {
+      const listSelectors = ['CHAT_LIST', 'CHAT_LIST_ITEM', 'ACTIVE_CHAT_ITEM'];
+      const targetModule = listSelectors.includes(name) ? 'chatObserver' : 'chatConversation';
+      const val = window.PreflightCheck.getSelector(targetModule, name);
+      if (typeof val === 'string') return [val];
+      if (Array.isArray(val) && val.length > 0) return val;
+    }
+    return SELECTORS[name] || [];
+  }
+
   // ============================================================
   // DOM 定位工具
   // ============================================================
@@ -180,7 +193,7 @@ window.ChatInteractor = (() => {
    */
   async function clickSend() {
     const sim = window.HumanSimulator;
-    const sendBtn = findElement(SELECTORS.SEND_BUTTON);
+    const sendBtn = findElement(SEL('SEND_BUTTON'));
 
     if (sendBtn) {
       // 等一下再点发送，模拟检查
@@ -192,7 +205,7 @@ window.ChatInteractor = (() => {
 
     // 备选方案：模拟 Enter 键发送
     console.log(`${LOG_PREFIX} 未找到发送按钮，尝试 Enter 键发送`);
-    const inputEl = findElement(SELECTORS.INPUT_BOX);
+    const inputEl = findElement(SEL('INPUT_BOX'));
     if (inputEl) {
       inputEl.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'Enter',
@@ -218,7 +231,7 @@ window.ChatInteractor = (() => {
    */
   async function sendMessage(text) {
     try {
-      const inputEl = await waitForElement(SELECTORS.INPUT_BOX);
+      const inputEl = await waitForElement(SEL('INPUT_BOX'));
       clearInput(inputEl);
       await simulateTyping(inputEl, text);
       const sent = await clickSend();
@@ -261,16 +274,27 @@ window.ChatInteractor = (() => {
   function getVisibleMessages() {
     const messages = [];
 
+    function getAncestorClasses(el, depth = 5) {
+      let classes = '';
+      let current = el;
+      for (let i = 0; i < depth && current; i++) {
+        classes += ' ' + (current.className || '');
+        current = current.parentElement;
+      }
+      return classes.toLowerCase();
+    }
+
     // 尝试多种选择器
-    for (const selector of SELECTORS.MESSAGE_BUBBLE) {
+    for (const selector of SEL('MESSAGE_BUBBLE')) {
       const elements = document.querySelectorAll(selector);
       if (elements.length > 0) {
         elements.forEach(el => {
           const text = el.textContent?.trim();
           if (text) {
-            // 判断是对方发的还是自己发的
-            const parentClasses = el.closest('[class]')?.className || '';
-            const isSelf = /self|right|mine|send/.test(parentClasses);
+            // 判断是对方发的还是自己发的（如果不是对方发的就是自己发的或系统消息）
+            const parentClasses = getAncestorClasses(el, 5);
+            const isCandidate = /friend|item-friend|left/.test(parentClasses);
+            const isSelf = !isCandidate;
             messages.push({
               text,
               isSelf,

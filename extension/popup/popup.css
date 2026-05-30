@@ -272,45 +272,92 @@ body {
   transform: translateY(0);
 }
 
-/* ---- Greeting Section ---- */
-.greeting-section {
+/* ---- Calibration Section ---- */
+.calibration-section {
   background: var(--bg-secondary);
   border-radius: var(--radius);
   padding: 14px 16px;
   border: 1px solid var(--border);
 }
 
-.section-header-row {
+.calibration-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cal-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-}
-
-.section-header-row .section-title {
-  margin-bottom: 0;
-}
-
-.quota-badge {
+  gap: 8px;
   font-size: 12px;
-  font-weight: 700;
+  padding: 4px 0;
+}
+
+.cal-dot {
+  font-size: 14px;
+  flex-shrink: 0;
+  width: 20px;
+  text-align: center;
+}
+
+.cal-label {
+  color: var(--text-primary);
+  font-weight: 500;
+  flex: 1;
+}
+
+.cal-status {
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: 'SF Mono', 'Menlo', monospace;
+}
+
+.cal-status.passed {
+  color: var(--success);
+}
+
+.cal-status.failed {
+  color: var(--danger);
+}
+
+.cal-status.cached {
   color: #a29bfe;
-  background: rgba(108, 92, 231, 0.15);
-  padding: 3px 10px;
-  border-radius: 10px;
 }
 
-.btn-accent {
-  width: 100%;
-  margin-top: 8px;
-  background: linear-gradient(135deg, #00cec9, #6c5ce7);
-  color: #fff;
-  border: none;
+.cal-btn {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  background: rgba(99, 102, 241, 0.1);
+  color: #a5b4fc;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.btn-accent:hover {
-  background: linear-gradient(135deg, #00e6e0, #7c6ef7);
-  box-shadow: 0 4px 15px rgba(0, 206, 201, 0.3);
-  transform: translateY(-1px);
+.cal-btn:hover {
+  background: rgba(99, 102, 241, 0.25);
+  color: #c7d2fe;
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.cal-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cal-btn.btn-go {
+  border-color: rgba(0, 206, 201, 0.3);
+  background: rgba(0, 206, 201, 0.1);
+  color: #00cec9;
+}
+
+.cal-btn.btn-go:hover {
+  background: rgba(0, 206, 201, 0.25);
+  border-color: rgba(0, 206, 201, 0.5);
 }
 

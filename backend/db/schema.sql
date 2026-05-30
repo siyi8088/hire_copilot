@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     greeting_text TEXT,              -- 预设招呼语（记录发了什么）
     followup_text TEXT,              -- 跟进消息内容
     status TEXT DEFAULT 'pending',   -- filtered / pending / approved / sent / followed_up / replied / ignored
+    source TEXT DEFAULT 'recommend', -- recommend / chat
     job_post_id INTEGER,
     sent_at TIMESTAMP,
     followup_at TIMESTAMP,

@@ -20,72 +20,22 @@
   const VERSION = '0.1.0';
 
   // ============================================================
-  // DOM 选择器 — 需要在实际页面调试确认
+  // DOM 选择器 — 从 SelectorRegistry + PreflightCheck 动态获取
   // ============================================================
-  const SELECTORS = {
-    // 候选人卡片列表容器
-    CARD_CONTAINER: [
-      'ul.card-list',
-      'div.list-wrap.card-list-wrap',
-      'div.recommend-list-wrap',
-      'div.recommend-card-list',
-      'div[class*="recommend"] ul',
-      'div[class*="card-list"]',
-      'div.recommend-main',
-      'div[class*="recommend-list"]',
-      '.recommend-content',
-    ],
+  const MODULE_NAME = 'recommendGreeter';
 
-    // 单个候选人卡片
-    CARD_ITEM: [
-      'li.card-item',
-      'div.candidate-card-wrap',
-      'div.recommend-card-item',
-      'div[class*="card-item"]',
-      'li[class*="card"]',
-      'div[class*="candidate-card"]',
-      'div.card-inner',
-    ],
+  // 校准状态
+  let preflightResult = null;
 
-    // 卡片内的字段选择器
-    CARD_NAME: [
-      'span.name', '.name-text', '[class*="name"]',
-    ],
-    CARD_ONLINE: [
-      'span.status', '.active-tag', '[class*="active-status"]', '[class*="online"]',
-    ],
-    CARD_BASE_INFO: [
-      '.base-info', '.info-text', 'span[class*="info"]',
-    ],
-    CARD_SALARY: [
-      '.expect-salary', '.salary-tag', 'span[class*="salary"]',
-      'span[class*="expect"]', '.tag-salary',
-    ],
-    CARD_EXPECT: [
-      '.expect-position', '.expect-info', '[class*="expect"]',
-    ],
-    CARD_ADVANTAGE: [
-      '.advantage-text', '.desc-text', '[class*="advantage"]',
-      '[class*="优势"]',
-    ],
-    CARD_TAGS: [
-      '.tag-list span', '.skill-tags span', '.tag-item',
-      '[class*="tag"] span', '[class*="skill"] span',
-    ],
-    CARD_EXPERIENCE: [
-      '.work-history', '.experience-list', '[class*="history"]',
-      '[class*="experience"]',
-    ],
-    GREET_BUTTON: [
-      'button.btn-greet',
-      'button.greet-btn',
-      'a.greet-btn',
-      '.btn-greet',
-      'button[class*="greet"]',
-      'a[class*="greet"]',
-      'span[class*="greet"]',
-    ],
-  };
+  /**
+   * 获取选择器（优先从已校准缓存中取，否则从注册表取原始 candidates）
+   */
+  function SEL(name) {
+    const val = window.PreflightCheck.getSelector(MODULE_NAME, name);
+    // 如果返回字符串（已校准匹配到的），包装成数组以兼容 findElement/findAllElements
+    if (typeof val === 'string') return [val];
+    return val || [];
+  }
 
   // ============================================================
   // 状态管理
@@ -108,6 +58,8 @@
     quota: { used: 0, limit: 20, remaining: 20 },
     panelElement: null,       // 审核面板 DOM 引用
     panelDismissed: false,
+    evaluatedFingerprints: new Set(), // 已评估的候选人指纹，去重防刷
+    currentJobTitle: '',       // 当前正在扫描的岗位，用于切换岗位时重置去重
   };
 
   // ============================================================
@@ -117,7 +69,12 @@
   /**
    * 尝试多个选择器找到元素
    */
-  function findElement(selectorList, parent = document) {
+  function findElement(selectorListOrName, parent = document) {
+    // 支持传入选择器名称字符串（如 'CARD_CONTAINER'）或数组
+    const selectorList = typeof selectorListOrName === 'string' && !selectorListOrName.includes('.')
+      ? SEL(selectorListOrName)
+      : (Array.isArray(selectorListOrName) ? selectorListOrName : [selectorListOrName]);
+
     for (const sel of selectorList) {
       try {
         const el = parent.querySelector(sel);
@@ -147,7 +104,12 @@
   /**
    * 尝试多个选择器找到所有匹配元素
    */
-  function findAllElements(selectorList, parent = document) {
+  function findAllElements(selectorListOrName, parent = document) {
+    // 支持传入选择器名称字符串（如 'CARD_ITEM'）或数组
+    const selectorList = typeof selectorListOrName === 'string' && !selectorListOrName.includes('.')
+      ? SEL(selectorListOrName)
+      : (Array.isArray(selectorListOrName) ? selectorListOrName : [selectorListOrName]);
+
     for (const sel of selectorList) {
       try {
         const els = parent.querySelectorAll(sel);
@@ -177,8 +139,8 @@
   /**
    * 获取元素的文本内容
    */
-  function getText(selectorList, parent = document) {
-    const el = findElement(selectorList, parent);
+  function getText(selectorListOrName, parent = document) {
+    const el = findElement(selectorListOrName, parent);
     return el?.textContent?.trim() || '';
   }
 
@@ -187,14 +149,14 @@
    */
   function parseCardElement(cardEl) {
     // 姓名
-    const name = getText(SELECTORS.CARD_NAME, cardEl);
+    const name = getText(SEL('CARD_NAME'), cardEl);
 
     // 在线状态
-    const onlineStatus = getText(SELECTORS.CARD_ONLINE, cardEl);
+    const onlineStatus = getText(SEL('CARD_ONLINE'), cardEl);
 
     // 基本信息行 — "29岁 5年 硕士 离职-随时到岗"
     // 这通常是一组 span 或一段文本
-    const baseInfoEl = findElement(SELECTORS.CARD_BASE_INFO, cardEl);
+    const baseInfoEl = findElement(SEL('CARD_BASE_INFO'), cardEl);
     const baseInfoText = baseInfoEl?.textContent?.trim() || '';
 
     // 从基本信息解析
@@ -204,29 +166,29 @@
     const statusMatch = baseInfoText.match(/(离职[\-\s]?随时到岗|在职[\-\s]?考虑机会|在职[\-\s]?月内到岗|在职[\-\s]?暂不考虑)/);
 
     // 期望薪资
-    const salary = getText(SELECTORS.CARD_SALARY, cardEl);
+    const salary = getText(SEL('CARD_SALARY'), cardEl);
 
     // 期望职位
-    const expectText = getText(SELECTORS.CARD_EXPECT, cardEl);
+    const expectText = getText(SEL('CARD_EXPECT'), cardEl);
 
     // 优势描述
-    const advantage = getText(SELECTORS.CARD_ADVANTAGE, cardEl);
+    const advantage = getText(SEL('CARD_ADVANTAGE'), cardEl);
 
     // 技术标签
-    const tagElements = findAllElements(SELECTORS.CARD_TAGS, cardEl);
+    const tagElements = findAllElements(SEL('CARD_TAGS'), cardEl);
     const tags = tagElements
       .map(el => el.textContent?.trim())
       .filter(t => t && t.length > 0);
 
     // 工作经历（右侧区域）
-    const expElements = findAllElements(SELECTORS.CARD_EXPERIENCE, cardEl);
+    const expElements = findAllElements(SEL('CARD_EXPERIENCE'), cardEl);
     const workHistory = expElements
       .map(el => el.textContent?.trim())
       .filter(t => t)
       .join(' | ');
 
     // 打招呼按钮 (优先使用选择器查找，若未找到，则通过按钮文本内容进行兜底匹配)
-    let greetBtn = findElement(SELECTORS.GREET_BUTTON, cardEl);
+    let greetBtn = findElement(SEL('GREET_BUTTON'), cardEl);
     if (!greetBtn) {
       const allButtons = cardEl.querySelectorAll('button, a, span[class*="btn"], div[class*="btn"]');
       for (const btn of allButtons) {
@@ -265,14 +227,14 @@
    * 扫描页面中所有可见的候选人卡片
    */
   function scanVisibleCards() {
-    const container = findElement(SELECTORS.CARD_CONTAINER);
+    const container = findElement(SEL('CARD_CONTAINER'));
     if (!container) {
       console.warn(`${LOG_PREFIX} 未找到候选人列表容器`);
       // 降级方案：直接在整个页面查找卡片
     }
 
     const parent = container || document;
-    const cardElements = findAllElements(SELECTORS.CARD_ITEM, parent);
+    const cardElements = findAllElements(SEL('CARD_ITEM'), parent);
 
     console.log(`${LOG_PREFIX} 找到 ${cardElements.length} 个候选人卡片`);
 
@@ -538,101 +500,7 @@
       });
     }
   }
-  /**
-   * 收集页面 HTML 结构进行调试，用于针对性分析选择器
-   */
-  function collectPageDebugInfo() {
-    const container = findElement(SELECTORS.CARD_CONTAINER);
-    const cardElements = findAllElements(SELECTORS.CARD_ITEM, container || document);
-    
-    // 搜寻页面上所有可能的可见弹窗 HTML
-    const docs = [document];
-    if (window.parent && window.parent.document && window.parent.document !== document) {
-      docs.push(window.parent.document);
-    }
-    const containerDoc = container ? container.ownerDocument : null;
-    if (containerDoc && !docs.includes(containerDoc)) {
-      docs.push(containerDoc);
-    }
 
-    const activeDialogs = [];
-    for (const docObj of docs) {
-      try {
-        const dialogEls = docObj.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"], [class*="recommend-filter-guide"], [class*="dialog"]');
-        for (const el of dialogEls) {
-          const rect = el.getBoundingClientRect();
-          if (rect.width > 0 && rect.height > 0) {
-            activeDialogs.push({
-              class: el.className,
-              html: el.outerHTML.slice(0, 10000)
-            });
-          }
-        }
-      } catch (e) {}
-    }
-
-    const info = {
-      url: window.location.href,
-      cardsCount: cardElements.length,
-      firstCardHtml: cardElements[0] ? cardElements[0].outerHTML.slice(0, 8000) : '未找到任何候选人卡片',
-      parentContainerHtml: container ? container.outerHTML.slice(0, 5000) : '未找到候选人容器',
-      activeDialogs: activeDialogs,
-      diagnosticsText: getDOMDiagnosticsText()
-    };
-
-    return info;
-  }
-
-  /**
-   * 填充并展示调试信息容器
-   */
-  function showPageDebugInfo() {
-    try {
-      const debugInfo = collectPageDebugInfo();
-      const debugText = JSON.stringify(debugInfo, null, 2);
-      const debugTextarea = document.getElementById('copilot-debug-text');
-      const debugContainer = document.getElementById('copilot-debug-container');
-      
-      if (debugTextarea && debugContainer) {
-        debugTextarea.value = debugText;
-        debugContainer.style.display = 'block';
-        
-        document.getElementById('copilot-btn-copy-debug').onclick = async () => {
-          const btn = document.getElementById('copilot-btn-copy-debug');
-          // 重新实时抓取最新的页面 DOM 状态以捕获新出现的弹窗！
-          const latestInfo = collectPageDebugInfo();
-          const latestText = JSON.stringify(latestInfo, null, 2);
-          if (debugTextarea) {
-            debugTextarea.value = latestText;
-          }
-
-          try {
-            await navigator.clipboard.writeText(latestText);
-            btn.textContent = '✅ 已成功复制调试数据！';
-            btn.style.background = '#10b981';
-            setTimeout(() => {
-              btn.textContent = '📋 复制页面 HTML 信息 (发给 AI 修复)';
-              btn.style.background = '#6366f1';
-            }, 2000);
-          } catch (err) {
-            // 备选复制
-            if (debugTextarea) {
-              debugTextarea.select();
-            }
-            document.execCommand('copy');
-            btn.textContent = '✅ 已成功复制调试数据！';
-            btn.style.background = '#10b981';
-            setTimeout(() => {
-              btn.textContent = '📋 复制页面 HTML 信息 (发给 AI 修复)';
-              btn.style.background = '#6366f1';
-            }, 2000);
-          }
-        };
-      }
-    } catch (e) {
-      console.error('填充调试信息失败:', e);
-    }
-  }
   /**
    * 滚动加载更多候选人
    */
@@ -640,17 +508,30 @@
     const sim = window.HumanSimulator;
     const allCandidates = new Map(); // fingerprint → candidate
 
+    // 辅助函数：将新扫描到的非重复、未评估卡片加入 map
+    const filterAndAdd = (cards) => {
+      cards.forEach(c => {
+        if (state.evaluatedFingerprints && state.evaluatedFingerprints.has(c.fingerprint)) {
+          // 已经评估过，跳过
+          return;
+        }
+        if (!allCandidates.has(c.fingerprint)) {
+          allCandidates.set(c.fingerprint, c);
+        }
+      });
+    };
+
     // 先扫描当前可见的
     const initial = scanVisibleCards();
-    initial.forEach(c => allCandidates.set(c.fingerprint, c));
+    filterAndAdd(initial);
 
     // 滚动加载更多
-    const scrollContainer = findElement(SELECTORS.CARD_CONTAINER) ||
+    const scrollContainer = findElement(SEL('CARD_CONTAINER')) ||
                             document.querySelector('.main-content') ||
                             document.documentElement;
 
     let noNewCount = 0;
-    const maxScrolls = 10;
+    const maxScrolls = 40; // 调大滚动限制，防止跳过已评估人员时滚动次数不够
 
     for (let i = 0; i < maxScrolls && allCandidates.size < maxCount; i++) {
       const prevSize = allCandidates.size;
@@ -688,26 +569,22 @@
 
       // 扫描新卡片
       const newCards = scanVisibleCards();
-      newCards.forEach(c => {
-        if (!allCandidates.has(c.fingerprint)) {
-          allCandidates.set(c.fingerprint, c);
-        }
-      });
+      filterAndAdd(newCards);
 
       if (allCandidates.size === prevSize) {
         noNewCount++;
-        if (noNewCount >= 3) {
-          console.log(`${LOG_PREFIX} 连续 3 次没有新候选人，停止滚动`);
+        if (noNewCount >= 5) { // 调大空转限制，防止由于过滤较多导致的连续未增加新人员误判
+          console.log(`${LOG_PREFIX} 连续 5 次没有找到全新候选人，停止滚动`);
           break;
         }
       } else {
         noNewCount = 0;
       }
 
-      console.log(`${LOG_PREFIX} 滚动 ${i + 1}/${maxScrolls}, 已收集 ${allCandidates.size} 人`);
+      console.log(`${LOG_PREFIX} 滚动 ${i + 1}/${maxScrolls}, 已收集全新候选人 ${allCandidates.size} 人`);
     }
 
-    // 严格限制返回的候选人数量不超过 maxCount，防止页面预加载了过多卡片导致评估超时
+    // 严格限制返回的候选人数量不超过 maxCount，防止评估超时
     return [...allCandidates.values()].slice(0, maxCount);
   }
 
@@ -734,28 +611,20 @@
    * 从推荐牛人页面（主页面或 iframe 内）提取当前活跃的岗位标题
    */
   function scrapeActiveJobOnRecommendPage() {
-    const selectors = [
-      '.job-select-box .cur-name',
-      '.job-select-box .cur-value',
-      '.job-select .cur-name',
-      '.job-select .cur-value',
-      '.job-select .dropdown-select-title',
-      '.job-select .dropdown-select-val',
-      '.job-selector .cur-name',
-      '.job-selector .cur-value',
-      '.job-selector-box .job-name',
-      '.dropdown-select-title',
-      '.dropdown-select-val',
-      '.select-target',
-      'div[class*="job-select"]',
-      'div[class*="dropdown-select"]',
-      'div[class*="select-job"]',
-    ];
+    const selectors = SEL('JOB_SELECT');
 
     const checkElementText = (el) => {
       if (!el) return null;
+      // 避免包含子列表的包裹容器，剔除包含列表的容器
+      if (el.querySelector('ul') || el.querySelector('li') || el.querySelector('dl') || el.querySelector('ol')) {
+        return null;
+      }
       const txt = el.textContent?.trim();
       if (txt && txt.length > 2 && txt.length < 80 && !txt.includes('打招呼') && !txt.includes('推荐') && !txt.includes('最新')) {
+        // 如果包含多行或明显的多个岗位和菜单项拼接，剔除
+        if (txt.includes('\n') || txt.includes('\r') || txt.includes('调整顺序') || txt.split(/\s{2,}/).length > 2) {
+          return null;
+        }
         return txt;
       }
       return null;
@@ -863,20 +732,14 @@
         <!-- 候选人卡片将在这里动态生成 -->
       </div>
 
-      <div id="copilot-debug-container" style="margin: 10px 16px; display: none; text-align: left;">
-        <button class="crp-btn" id="copilot-btn-copy-debug" style="width: 100%; margin-bottom: 8px; background: #6366f1; color: white; padding: 6px; font-size: 11px; border-radius: 4px; border: none; cursor: pointer;">
-          📋 复制页面 HTML 信息 (发给 AI 修复)
-        </button>
-        <textarea id="copilot-debug-text" style="width: 100%; height: 100px; background: #111827; color: #9ca3af; border: 1px solid #374151; border-radius: 6px; padding: 6px; font-size: 9px; font-family: monospace; resize: none;" readonly></textarea>
-      </div>
 
-      <div class="crp-footer" id="crp-footer">
-        <div class="crp-selected-count">
-          已选 <span id="crp-selected-num">0</span> 人
+
+      <div class="crp-footer" id="crp-footer" style="display: flex; flex-direction: column; gap: 8px; align-items: stretch; padding: 12px 16px;">
+        <div class="crp-tip-safe" style="font-size: 11px; color: #2ed573; text-align: left; line-height: 1.4; background: rgba(46, 213, 115, 0.08); padding: 8px; border-radius: 4px; border: 1px solid rgba(46, 213, 115, 0.15);">
+          🛡️ <b>最安全半自动模式已启用</b>：点击候选人右侧的<b>“定位去沟通 🔍”</b>，系统会自动将其在网页中高亮闪烁，由您<b>物理点击打招呼</b>。100% 模拟真实操作，绕过一切限流与封号风控！
         </div>
-        <div class="crp-actions">
-          <button class="crp-btn crp-btn-scan" id="crp-scan-btn">🔍 扫描候选人</button>
-          <button class="crp-btn crp-btn-greet" id="crp-greet-btn" disabled>👋 开始打招呼</button>
+        <div class="crp-actions" style="display: flex; justify-content: center; width: 100%;">
+          <button class="crp-btn crp-btn-scan" id="crp-scan-btn" style="width: 100%; padding: 10px; font-weight: bold; background: #6c5ce7; color: white; border: none; border-radius: 4px; cursor: pointer;">🔍 扫描并筛选候选人</button>
         </div>
       </div>
     `;
@@ -891,7 +754,6 @@
     });
 
     document.getElementById('crp-scan-btn').addEventListener('click', startScanFlow);
-    document.getElementById('crp-greet-btn').addEventListener('click', startGreetingFlow);
 
     return panel;
   }
@@ -932,27 +794,36 @@
         const score = c.matchScore?.toFixed(1) || '?';
         const scoreClass = c.matchScore >= 8 ? 'high' : c.matchScore >= 6.5 ? 'mid' : 'low';
         const tags = (c.tags || []).slice(0, 4).join(' · ');
+        const isGreeted = c.greeted;
+
+        const actionBtnHtml = isGreeted 
+          ? `<span class="crp-card-badge-greeted" style="font-size: 11px; background: rgba(46, 213, 115, 0.15); color: #2ed573; padding: 4px 8px; border-radius: 4px; font-weight: bold; border: 1px solid rgba(46, 213, 115, 0.25);">已去沟通</span>`
+          : `<button class="crp-btn crp-btn-locate" data-index="${i}" style="font-size: 11px; background: #6c5ce7; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s;">定位去沟通 🔍</button>`;
 
         return `
-          <label class="crp-card" data-index="${i}">
-            <input type="checkbox" class="crp-checkbox" data-index="${i}" checked>
-            <div class="crp-card-content">
-              <div class="crp-card-header">
-                <span class="crp-card-name">${c.name || '未知'}</span>
-                <span class="crp-card-score ${scoreClass}">⭐${score}</span>
-                <span class="crp-card-status">${c.jobStatus || ''}</span>
+          <div class="crp-card" data-index="${i}" style="display: block; padding: 12px 14px; margin-bottom: 8px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.06); background: rgba(255, 255, 255, 0.02); transition: all 0.2s; ${isGreeted ? 'opacity: 0.6;' : ''}">
+            <div class="crp-card-content" style="width: 100%;">
+              <div class="crp-card-header" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span class="crp-card-name" style="font-size: 14px; font-weight: bold; color: #fff;">${c.name || '未知'}</span>
+                  <span class="crp-card-status" style="font-size: 11px; color: #8888a8;">${c.jobStatus || ''}</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                  <span class="crp-card-score ${scoreClass}">⭐${score}</span>
+                  ${actionBtnHtml}
+                </div>
               </div>
-              <div class="crp-card-info">
+              <div class="crp-card-info" style="font-size: 12px; color: #a8a8c8; margin-bottom: 4px;">
                 ${c.experience || ''} · ${c.education || ''} · ${c.salary || ''}
               </div>
-              <div class="crp-card-reason">${c.matchReason || ''}</div>
-              ${tags ? `<div class="crp-card-tags">${tags}</div>` : ''}
-              <div class="crp-card-followup">
-                <span class="crp-followup-label">跟进语:</span>
-                <span class="crp-followup-text">"${c.followupText || ''}"</span>
+              <div class="crp-card-reason" style="font-size: 11px; color: #9ca3af; line-height: 1.4; margin-bottom: 6px;">${c.matchReason || ''}</div>
+              ${tags ? `<div class="crp-card-tags" style="font-size: 10px; color: #818cf8; margin-bottom: 4px;">${tags}</div>` : ''}
+              <div class="crp-card-followup" style="font-size: 11px; background: rgba(255, 255, 255, 0.02); padding: 4px 6px; border-radius: 4px; border-left: 2px solid #6c5ce7;">
+                <span class="crp-followup-label" style="color: #8888a8;">跟进语:</span>
+                <span class="crp-followup-text" style="color: #a8a8c8; font-style: italic;">"${c.followupText || ''}"</span>
               </div>
             </div>
-          </label>
+          </div>
         `;
       }).join('');
     }
@@ -994,49 +865,180 @@
 
     listEl.innerHTML = html;
 
-    // 绑定 checkbox 事件
-    listEl.querySelectorAll('.crp-checkbox').forEach(cb => {
-      cb.addEventListener('change', updateSelectedCount);
+    // 绑定 定位去沟通 按钮的事件
+    listEl.querySelectorAll('.crp-btn-locate').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const index = parseInt(btn.dataset.index);
+        const candidate = state.rankedCandidates[index];
+        if (candidate) {
+          await locateAndGreetCandidate(candidate, index);
+        }
+      });
     });
+  }
 
-    updateSelectedCount();
+  /**
+   * 定位候选人，进行高亮，并在用户物理点击时无感记录和跟进
+   */
+  async function locateAndGreetCandidate(candidate, index) {
+    // 1. 通知后端批准该候选人，使其在后端 DB 状态流转为“已审核”
+    if (candidate.greetingId) {
+      try {
+        await sendToBackground({
+          type: 'APPROVE_GREETINGS',
+          payload: { greetingIds: [candidate.greetingId] },
+        });
+        console.log(`${LOG_PREFIX} 已通知后端批准候选人: ${candidate.name}`);
+      } catch (err) {
+        console.error(`${LOG_PREFIX} 批准单个请求失败:`, err);
+      }
+    }
 
-    // 启用打招呼按钮
-    const greetBtn = document.getElementById('crp-greet-btn');
+    // 2. 在当前页面/iframe中寻找最鲜活的卡片和打招呼按钮
+    const liveElements = findLiveGreetButton(candidate);
+    if (!liveElements) {
+      alert(`未能在页面当前列表中找到候选人 [${candidate.name}]。请尝试手动在页面列表中向下滚动寻找，或重新扫描。`);
+      return;
+    }
+
+    const { cardEl, greetBtn } = liveElements;
+
+    // 3. 平滑滚动到卡片位置
+    cardEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    // 4. 为卡片添加黄色粗边框和发光的高亮闪烁动画，提醒用户点击
+    cardEl.style.transition = 'all 0.5s ease';
+    cardEl.style.outline = '4px solid #f1c40f'; // 粗黄边框
+    cardEl.style.boxShadow = '0 0 25px #f1c40f'; // 黄色发光
+    
+    // 定时移除高亮效果
+    setTimeout(() => {
+      cardEl.style.outline = '';
+      cardEl.style.boxShadow = '';
+    }, 4000);
+
+    // 5. 闪烁真实的“打招呼”按钮，让其更醒目
     if (greetBtn) {
-      greetBtn.disabled = state.rankedCandidates.length === 0;
+      greetBtn.style.transition = 'all 0.3s ease';
+      greetBtn.style.transform = 'scale(1.1)';
+      greetBtn.style.border = '2px solid #fff';
+      setTimeout(() => {
+        greetBtn.style.transform = '';
+        greetBtn.style.border = '';
+      }, 2000);
+    }
+
+    // 6. 为真实的“打招呼”按钮绑定一次性物理点击事件
+    if (greetBtn && !greetBtn._hasCopilotListener) {
+      greetBtn._hasCopilotListener = true;
+      
+      const handlePhysicalClick = async (event) => {
+        // 只有真实的物理点击才进行记录，规避一切机器人模拟检测
+        if (event.isTrusted) {
+          console.log(`${LOG_PREFIX} ✅ 检测到用户对 ${candidate.name} 的真实物理点击打招呼！`);
+          
+          // 标记面板状态为已打招呼
+          candidate.greeted = true;
+          
+          // 更新配额
+          state.quota.used++;
+          state.quota.remaining = Math.max(0, state.quota.remaining - 1);
+          const quotaEl = document.getElementById('crp-quota-num');
+          if (quotaEl) quotaEl.textContent = state.quota.remaining;
+
+          // 通知后端打招呼已发送，进行 DB 状态同步
+          if (candidate.greetingId) {
+            try {
+              await sendToBackground({
+                type: 'GREETING_SENT',
+                payload: { greetingId: candidate.greetingId },
+              });
+              console.log(`${LOG_PREFIX} 打招呼状态已同步至后端 DB`);
+            } catch (err) {
+              console.error(`${LOG_PREFIX} 同步打招呼状态失败:`, err);
+            }
+          }
+
+          // 准备跟进语到 storage 供聊天页面监听跟进发送
+          if (candidate.followupText) {
+            await saveFollowupToStorage(candidate);
+          }
+
+          // 重新渲染候选人列表以更新状态
+          renderCandidateList();
+        }
+      };
+
+      greetBtn.addEventListener('click', handlePhysicalClick, { once: true });
     }
   }
 
   /**
-   * 更新已选人数
+   * 动态寻找当前 DOM 树中特定候选人的最新卡片与打招呼按钮
    */
-  function updateSelectedCount() {
-    const checkboxes = document.querySelectorAll('.crp-checkbox:checked');
-    const countEl = document.getElementById('crp-selected-num');
-    if (countEl) countEl.textContent = checkboxes.length;
-  }
+  function findLiveGreetButton(candidate) {
+    const docs = [document];
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const innerDoc = iframe.contentDocument || iframe.contentWindow.document;
+        if (innerDoc) {
+          docs.push(innerDoc);
+        }
+      } catch (e) {
+        // 跨域 iframe 忽略
+      }
+    }
 
-  /**
-   * 获取用户选中的候选人
-   */
-  function getSelectedCandidates() {
-    const checkboxes = document.querySelectorAll('.crp-checkbox:checked');
-    const indices = [...checkboxes].map(cb => parseInt(cb.dataset.index));
-    return indices.map(i => state.rankedCandidates[i]).filter(Boolean);
+    for (const doc of docs) {
+      const cards = findAllElements(SEL('CARD_ITEM'), doc);
+      for (const card of cards) {
+        const nameText = getText(SEL('CARD_NAME'), card)?.trim() || '';
+        if (nameText && (nameText === candidate.name || nameText.includes(candidate.name) || candidate.name.includes(nameText))) {
+          // 进一步验证薪资，防止名字相同误判
+          const salary = getText(SEL('CARD_SALARY'), card)?.trim() || '';
+          const isSalaryMatch = !candidate.salary || !salary || salary === candidate.salary || salary.includes(candidate.salary) || candidate.salary.includes(salary);
+          
+          if (isSalaryMatch) {
+            // 重新在当前卡片中查找打招呼按钮
+            let greetBtn = findElement(SEL('GREET_BUTTON'), card);
+            if (!greetBtn) {
+              const allButtons = card.querySelectorAll('button, a, span[class*="btn"], div[class*="btn"]');
+              for (const btn of allButtons) {
+                const text = btn.textContent?.trim() || '';
+                if (text === '打招呼' || text === '立即沟通' || text === '聊一聊' || text === '沟通' || text.includes('沟通') || text.includes('打招呼')) {
+                  if (text.length < 10) {
+                    greetBtn = btn;
+                    break;
+                  }
+                }
+              }
+            }
+            if (greetBtn) {
+              return { cardEl: card, greetBtn };
+            }
+          }
+        }
+      }
+    }
+    return null;
   }
-
-  // ============================================================
-  // 核心流程
-  // ============================================================
 
   /**
    * Step 1: 扫描 → 评估
    */
   async function startScanFlow() {
-    if (state.phase !== 'idle' && state.phase !== 'done') {
-      console.warn(`${LOG_PREFIX} 当前状态 ${state.phase}，无法开始扫描`);
+    if (state.phase === 'scanning' || state.phase === 'evaluating') {
+      console.warn(`${LOG_PREFIX} 当前状态 ${state.phase}，正在处理中，无法重复扫描`);
       return;
+    }
+
+    // 检查招聘岗位是否切换，切换则清除指纹去重历史
+    const jobTitle = scrapeActiveJobOnRecommendPage();
+    if (jobTitle && jobTitle !== state.currentJobTitle) {
+      console.log(`${LOG_PREFIX} 检测到招聘岗位切换从 "${state.currentJobTitle}" 到 "${jobTitle}"，清空去重历史`);
+      state.evaluatedFingerprints.clear();
+      state.currentJobTitle = jobTitle;
     }
 
     state.phase = 'scanning';
@@ -1082,6 +1084,13 @@
         return;
       }
 
+      // 成功评估后，将指纹加入已评估 Set 避免下次扫描重复拉取
+      candidates.forEach(c => {
+        if (c.fingerprint) {
+          state.evaluatedFingerprints.add(c.fingerprint);
+        }
+      });
+
       // 保存评估结果
       state.rankedCandidates = result.ranked || [];
       state.filteredCandidates = result.filtered || [];
@@ -1107,241 +1116,6 @@
       state.phase = 'idle';
     }
 
-    if (scanBtn) {
-      scanBtn.disabled = false;
-      scanBtn.textContent = '🔍 重新扫描';
-    }
-
-    // 渲染并填充页面 HTML 调试收集器信息
-    showPageDebugInfo();
-  }
-
-  /**
-   * Step 2: 用户确认 → 执行打招呼
-   */
-  async function startGreetingFlow() {
-    if (state.phase !== 'reviewing') {
-      console.warn(`${LOG_PREFIX} 当前状态 ${state.phase}，无法开始打招呼`);
-      return;
-    }
-
-    const selected = getSelectedCandidates();
-    if (selected.length === 0) {
-      updatePanelStatus('请至少选择一个候选人');
-      return;
-    }
-
-    // 检查配额
-    if (selected.length > state.quota.remaining) {
-      updatePanelStatus(`选择了 ${selected.length} 人，但剩余配额只有 ${state.quota.remaining}`);
-      return;
-    }
-
-    state.phase = 'greeting';
-    state.approvedCandidates = selected;
-    state.greetingQueue = [...selected];
-    state.currentGreetingIndex = 0;
-
-    const greetBtn = document.getElementById('crp-greet-btn');
-    if (greetBtn) {
-      greetBtn.disabled = true;
-      greetBtn.textContent = '⏳ 打招呼中...';
-    }
-
-    // 先通知后端批准这些候选人
-    const greetingIds = selected
-      .map(c => c.greetingId)
-      .filter(Boolean);
-
-    if (greetingIds.length > 0) {
-      try {
-        await sendToBackground({
-          type: 'APPROVE_GREETINGS',
-          payload: { greetingIds },
-        });
-      } catch (err) {
-        console.error(`${LOG_PREFIX} 批准请求失败:`, err);
-      }
-    }
-
-    // 逐个执行打招呼
-    await executeGreetings();
-  }
-
-  /**
-   * 逐个执行打招呼
-   */
-  async function executeGreetings() {
-    const sim = window.HumanSimulator;
-
-    for (let i = 0; i < state.greetingQueue.length; i++) {
-      const candidate = state.greetingQueue[i];
-      state.currentGreetingIndex = i;
-
-      updatePanelStatus(
-        `正在打招呼 ${i + 1}/${state.greetingQueue.length}: ${candidate.name}`,
-        true
-      );
-
-      try {
-        // 找到对应的卡片和按钮
-        const cardIndex = state.scannedCandidates.findIndex(
-          c => c.fingerprint === candidate.fingerprint
-        );
-
-        let greetBtn = null;
-        if (cardIndex >= 0) {
-          const cardEl = state.scannedCandidates[cardIndex]._cardElement;
-          greetBtn = state.scannedCandidates[cardIndex]._greetButton;
-
-          // 滚动到卡片可见位置
-          if (cardEl) {
-            cardEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            await sim.sleep(sim.clampedGaussian(1000, 300, 500, 2000));
-          }
-        }
-
-        if (!greetBtn) {
-          // 降级：尝试在页面中找到这个候选人的打招呼按钮
-          console.warn(`${LOG_PREFIX} 未找到 ${candidate.name} 的打招呼按钮，跳过`);
-          state.stats.errors++;
-          continue;
-        }
-
-        // 检查按钮是否可点击及是否已经打过招呼
-        const btnText = greetBtn.textContent?.trim() || '';
-        const isAlreadyGreeted = btnText.includes('继续') || 
-                                 btnText.includes('聊过') || 
-                                 btnText.includes('发消息') || 
-                                 btnText.includes('已') ||
-                                 (!btnText.includes('打招呼') && !btnText.includes('聊一聊') && !btnText.includes('沟通') && btnText.length > 0);
-        if (greetBtn.disabled || greetBtn.classList.contains('disabled') || isAlreadyGreeted) {
-          console.warn(`${LOG_PREFIX} ${candidate.name} 的打招呼按钮不可用或已沟通，跳过 (文案: ${btnText})`);
-          continue;
-        }
-
-        // 点击打招呼按钮
-        greetBtn.click();
-        console.log(`${LOG_PREFIX} ✅ 已点击 ${candidate.name} 的打招呼按钮`);
-        
-        // 拟人化：等待弹窗渲染（0.8s - 1.5s）并自动确认职位关联或打招呼确认弹窗
-        await sim.sleep(sim.clampedGaussian(1000, 200, 800, 1500));
-        
-        // 收集所有可能的 document 对象（主文档、iframe 内部文档、以及 parent 文档）
-        const docs = [document];
-        if (window.parent && window.parent.document && window.parent.document !== document) {
-          docs.push(window.parent.document);
-        }
-        if (greetBtn.ownerDocument && !docs.includes(greetBtn.ownerDocument)) {
-          docs.push(greetBtn.ownerDocument);
-        }
-
-        let dialogs = [];
-        for (const docObj of docs) {
-          try {
-            const found = docObj.querySelectorAll('div[class*="dialog"], div[class*="modal"], div[class*="popover"], div.dialog-wrap, div[class*="popup"], [class*="recommend-filter-guide"]');
-            dialogs = dialogs.concat([...found]);
-          } catch (e) {
-            // 忽略由于跨域策略可能导致的错误
-          }
-        }
-
-        let dialogClicked = false;
-        for (const dialog of dialogs) {
-          const rect = dialog.getBoundingClientRect();
-          // 只检查在屏幕上渲染可见的弹窗
-          if (rect.width > 0 && rect.height > 0) {
-            console.log(`${LOG_PREFIX} 检测到可见确认弹窗，尝试自动点击“确定/发送”按钮...`);
-            
-            // 查找弹窗内的所有交互按钮 (放宽元素标签和类名匹配，以防混淆类名)
-            const buttons = dialog.querySelectorAll('button, a, span, div, [class*="btn"], [class*="button"], [role="button"]');
-            for (const btn of buttons) {
-              const text = btn.textContent?.trim() || '';
-              if (text === '确定' || text === '确认' || text === '发送' || text === '同意' || 
-                  text === '立即沟通' || text === '确认发送' ||
-                  text.includes('确定') || text.includes('确认') || text.includes('发送')) {
-                btn.click();
-                console.log(`${LOG_PREFIX} ✅ 已自动确认弹窗: "${text}"`);
-                dialogClicked = true;
-                break;
-              }
-            }
-            if (dialogClicked) {
-              // 确认后给弹窗一点点关闭动画的缓冲时间
-              await sim.sleep(500);
-              break;
-            }
-          }
-        }
-        
-        state.stats.greeted++;
-
-        // 通知后端记录
-        if (candidate.greetingId) {
-          try {
-            await sendToBackground({
-              type: 'GREETING_SENT',
-              payload: { greetingId: candidate.greetingId },
-            });
-          } catch (err) {
-            console.error(`${LOG_PREFIX} 通知后端失败:`, err);
-          }
-        }
-
-        // 保存跟进消息到 storage（聊天页面会读取并发送）
-        if (candidate.followupText) {
-          await saveFollowupToStorage(candidate);
-        }
-
-        // 更新配额
-        state.quota.used++;
-        state.quota.remaining = Math.max(0, state.quota.remaining - 1);
-        const quotaEl = document.getElementById('crp-quota-num');
-        if (quotaEl) quotaEl.textContent = state.quota.remaining;
-
-        // 检查是否达到每日上限
-        if (state.quota.remaining <= 0) {
-          console.log(`${LOG_PREFIX} 已达每日上限，停止打招呼`);
-          updatePanelStatus('已达每日 20 次上限，明天继续 ✋');
-          break;
-        }
-
-        // 等待间隔（2-5 分钟）— 如果不是最后一个
-        if (i < state.greetingQueue.length - 1) {
-          const interval = sim.clampedGaussian(
-            3 * 60 * 1000,  // 均值 3 分钟
-            60 * 1000,       // 标准差 1 分钟
-            2 * 60 * 1000,   // 最小 2 分钟
-            5 * 60 * 1000    // 最大 5 分钟
-          );
-          const mins = (interval / 60000).toFixed(1);
-          updatePanelStatus(
-            `已打招呼 ${i + 1}/${state.greetingQueue.length}，等待 ${mins} 分钟...`,
-            true
-          );
-          await sim.sleep(interval);
-        }
-
-      } catch (err) {
-        console.error(`${LOG_PREFIX} 打招呼失败 [${candidate.name}]:`, err);
-        state.stats.errors++;
-      }
-    }
-
-    // 完成
-    state.phase = 'done';
-    updatePanelStatus(
-      `✅ 完成！已打招呼 ${state.stats.greeted} 人，配额剩余 ${state.quota.remaining}`,
-      false
-    );
-
-    const greetBtn = document.getElementById('crp-greet-btn');
-    if (greetBtn) {
-      greetBtn.disabled = true;
-      greetBtn.textContent = '✅ 已完成';
-    }
-
-    const scanBtn = document.getElementById('crp-scan-btn');
     if (scanBtn) {
       scanBtn.disabled = false;
       scanBtn.textContent = '🔍 重新扫描';
@@ -1439,12 +1213,81 @@
   // 初始化
   // ============================================================
 
+  /**
+   * 校准失败时，在审核面板中显示诊断 UI
+   */
+  function showCalibrationFailureUI(results, reportResponse) {
+    const listEl = document.getElementById('crp-candidates-list');
+    if (!listEl) return;
+
+    listEl.innerHTML = window.PreflightCheck.renderCalibrationFailureHTML(MODULE_NAME, results, reportResponse);
+
+    // 绑定重新校准按钮
+    const retryBtn = document.getElementById('preflight-btn-retry');
+    if (retryBtn) {
+      retryBtn.addEventListener('click', async () => {
+        retryBtn.disabled = true;
+        retryBtn.textContent = '⏳ 校准中...';
+        await window.PreflightCheck.clearCache(MODULE_NAME);
+        preflightResult = await window.PreflightCheck.run(MODULE_NAME, { forceRefresh: true });
+        if (preflightResult.passed) {
+          updatePanelStatus('✅ 校准通过！可以开始扫描');
+          listEl.innerHTML = '<div style="padding: 20px; text-align: center; color: #2ed573; font-size: 14px;">✅ DOM 校准已通过，请点击下方按钮开始扫描</div>';
+          const scanBtn = document.getElementById('crp-scan-btn');
+          if (scanBtn) {
+            scanBtn.disabled = false;
+            scanBtn.textContent = '🔍 扫描并筛选候选人';
+          }
+        } else {
+          showCalibrationFailureUI(preflightResult.results, null);
+        }
+      });
+    }
+
+    // 绑定复制诊断数据按钮
+    const copyBtn = document.getElementById('preflight-btn-copy');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', async () => {
+        const diagData = JSON.stringify(results, null, 2);
+        try {
+          await navigator.clipboard.writeText(diagData);
+          copyBtn.textContent = '✅ 已复制！';
+          setTimeout(() => { copyBtn.textContent = '📋 复制诊断数据'; }, 2000);
+        } catch {
+          copyBtn.textContent = '❌ 复制失败';
+        }
+      });
+    }
+  }
+
   async function init() {
     console.log(`${LOG_PREFIX} v${VERSION} 已加载`);
     console.log(`${LOG_PREFIX} 页面: ${window.location.href}`);
 
     // 等待页面稳定
     await new Promise(resolve => setTimeout(resolve, 3000));
+
+    // ★ Preflight Check — 校准 DOM 选择器
+    if (window.PreflightCheck) {
+      preflightResult = await window.PreflightCheck.run(MODULE_NAME);
+      if (!preflightResult.passed) {
+        console.error(`${LOG_PREFIX} ❌ DOM 校准失败，业务逻辑已暂停`);
+        // 创建面板并显示校准失败 UI
+        if (window.location.href.includes('/web/chat/recommend')) {
+          createReviewPanel();
+          updatePanelStatus('🔴 DOM 校准失败');
+          showCalibrationFailureUI(preflightResult.results, null);
+          const scanBtn = document.getElementById('crp-scan-btn');
+          if (scanBtn) {
+            scanBtn.disabled = true;
+            scanBtn.textContent = '⛔ 校准失败，无法扫描';
+          }
+          uiCreated = true;
+        }
+        return;
+      }
+      console.log(`${LOG_PREFIX} ✅ DOM 校准通过${preflightResult.fromCache ? ' (缓存)' : ''}`);
+    }
 
     checkRoute();
     setInterval(checkRoute, 1000);

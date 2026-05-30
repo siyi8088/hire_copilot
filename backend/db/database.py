@@ -52,13 +52,32 @@ async def init_db():
         except Exception:
             pass
 
-        # 3.2 daily_stats 添加每日扫描和匹配列
+        # 3.2 daily_stats 添加每日扫描和匹配列及打招呼指标列
         try:
             await db.execute("ALTER TABLE daily_stats ADD COLUMN candidates_scanned INTEGER DEFAULT 0")
         except Exception:
             pass
         try:
             await db.execute("ALTER TABLE daily_stats ADD COLUMN candidates_matched INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE daily_stats ADD COLUMN greetings_sent INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE daily_stats ADD COLUMN greetings_followed_up INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE daily_stats ADD COLUMN greetings_replied INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
+        # 3.3 recommendations 添加 source 来源列
+        try:
+            await db.execute("ALTER TABLE recommendations ADD COLUMN source TEXT DEFAULT 'recommend'")
+            print("[DB] 动态为 recommendations 添加 source 来源列")
         except Exception:
             pass
 
@@ -90,6 +109,90 @@ async def get_or_create_candidate(chat_id: str) -> dict:
         )
         row = await cursor.fetchone()
         return dict(row)
+    finally:
+        await db.close()
+
+
+async def update_candidate_profile(chat_id: str, profile_data: dict):
+    """更新聊天候选人的微简历快照并自动补全推荐表记录"""
+    candidate_name = profile_data.get("name")
+    if not candidate_name:
+        return
+        
+    db = await get_db()
+    try:
+        # 1. 获取或创建候选人记录
+        cursor = await db.execute("SELECT id, name FROM candidates WHERE boss_chat_id = ?", (chat_id,))
+        row = await cursor.fetchone()
+        if not row:
+            await db.execute("INSERT INTO candidates (boss_chat_id, name, status) VALUES (?, ?, 'chatting')", (chat_id, candidate_name))
+            await db.commit()
+            cursor = await db.execute("SELECT id, name FROM candidates WHERE boss_chat_id = ?", (chat_id,))
+            row = await cursor.fetchone()
+            
+        candidate_id = row["id"]
+        
+        title = profile_data.get("title")
+        experience = profile_data.get("experience")
+        education = profile_data.get("education")
+        salary = profile_data.get("salary")
+        company = profile_data.get("company", "")
+
+        # 2. 更新 candidates 记录中的基本信息 (职位/姓名/年限等)
+        exp_years = None
+        if experience:
+            import re
+            m = re.search(r"(\d+)年", experience)
+            if m:
+                exp_years = int(m.group(1))
+
+        await db.execute(
+            """UPDATE candidates 
+               SET name = ?, 
+                   current_title = COALESCE(current_title, ?), 
+                   experience_years = COALESCE(experience_years, ?), 
+                   updated_at = CURRENT_TIMESTAMP 
+               WHERE id = ?""",
+            (candidate_name, title, exp_years, candidate_id)
+        )
+            
+        # 自动获取当前活跃岗位 id
+        job_cursor = await db.execute("SELECT id FROM job_posts WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1")
+        job_row = await job_cursor.fetchone()
+        job_post_id = job_row["id"] if job_row else None
+
+        # 3. 检查 recommendations 中是否存在关联 candidate_id 或候选人姓名的记录 (使用多维度模糊匹配)
+        rec_row = await find_matching_recommendation(db, candidate_id, profile_data, job_post_id)
+        
+        if rec_row:
+            rec_id = rec_row["id"]
+            # 如果推荐表中原本为“鄢先生”，且此处获取了真名，自动将其更新为真名
+            name_to_save = candidate_name if rec_row.get("candidate_name") != candidate_name else rec_row.get("candidate_name")
+            
+            # 更新已有推荐快照
+            await db.execute(
+                """UPDATE recommendations 
+                   SET candidate_id = ?, candidate_name = ?, candidate_title = ?, 
+                       candidate_experience = ?, candidate_education = ?, 
+                       candidate_salary = ?, candidate_company = ?, job_post_id = COALESCE(job_post_id, ?)
+                   WHERE id = ?""",
+                (candidate_id, name_to_save, title, experience, education, salary, company, job_post_id, rec_id)
+            )
+            print(f"[DB] 自动匹配更新聊天候选人推荐快照: old_name={rec_row.get('candidate_name')} -> name={candidate_name}, id={rec_id}")
+        else:
+            # 插入全新 chat 来源的推荐记录快照
+            await db.execute(
+                """INSERT INTO recommendations 
+                   (candidate_id, candidate_name, candidate_title, candidate_experience, 
+                    candidate_education, candidate_salary, candidate_company, source, status, job_post_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'chat', 'chatting', ?)""",
+                (candidate_id, candidate_name, title, experience, education, salary, company, job_post_id)
+            )
+            print(f"[DB] 自动补充全新聊天候选人推荐快照: name={candidate_name}, source=chat")
+            
+        await db.commit()
+    except Exception as e:
+        print(f"[DB] 更新候选人画像失败: {e}")
     finally:
         await db.close()
 
@@ -241,6 +344,123 @@ async def update_greeting_status(greeting_id: int, status: str,
         await db.commit()
     finally:
         await db.close()
+
+
+async def find_matching_recommendation(db, candidate_id: int, profile_data: dict, job_post_id: int | None = None) -> dict | None:
+    """
+    根据 candidate_id、候选人姓名及其他特征进行多维度评分匹配，查找 recommendations 记录。
+    支持模糊匹配，例如将“鄢先生”与真实姓名“鄢彪”成功关联。
+    """
+    # 1. 优先查找已经绑定了该 candidate_id 的推荐记录
+    cursor = await db.execute(
+        """SELECT * FROM recommendations 
+           WHERE candidate_id = ? 
+           ORDER BY created_at DESC LIMIT 1""",
+        (candidate_id,)
+    )
+    row = await cursor.fetchone()
+    if row:
+        return dict(row)
+
+    # 2. 如果没找到，再查找 candidate_id 为空且真实姓名完全一致 of the recommend record
+    candidate_name = profile_data.get("name", "")
+    if not candidate_name:
+        return None
+
+    cursor = await db.execute(
+        """SELECT * FROM recommendations 
+           WHERE candidate_id IS NULL AND candidate_name = ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (candidate_name,)
+    )
+    row = await cursor.fetchone()
+    if row:
+        return dict(row)
+
+    # 3. 多维度评分模糊匹配：对于 candidate_id 为空且来源为推荐 (recommend) 的记录进行打分
+    sql = """SELECT * FROM recommendations 
+             WHERE candidate_id IS NULL AND source = 'recommend'"""
+    cursor = await db.execute(sql)
+    rows = await cursor.fetchall()
+
+    best_match = None
+    best_score = 0
+
+    for r in rows:
+        rec = dict(r)
+        score = 0
+        
+        # 3.1 姓氏/性别称呼前缀必须匹配
+        rec_name = rec.get("candidate_name", "")
+        if not rec_name:
+            continue
+            
+        clean_rec = rec_name
+        for suffix in ["先生", "女士", "老师", "同学"]:
+            if clean_rec.endswith(suffix):
+                clean_rec = clean_rec[:-len(suffix)]
+                break
+                
+        # 必须以去除了称呼后缀的名字开头，例如 "鄢先生" -> "鄢" -> "鄢彪"
+        if not clean_rec or not candidate_name.startswith(clean_rec):
+            continue
+        score += 10
+        
+        # 3.2 岗位匹配
+        if job_post_id and rec.get("job_post_id") == job_post_id:
+            score += 5
+            
+        # 3.3 学历匹配
+        rec_edu = rec.get("candidate_education")
+        real_edu = profile_data.get("education")
+        if rec_edu and real_edu and (rec_edu in real_edu or real_edu in rec_edu):
+            score += 2
+            
+        # 3.4 工作年限匹配
+        rec_exp = rec.get("candidate_experience")
+        real_exp = profile_data.get("experience")
+        if rec_exp and real_exp:
+            clean_rec_exp = "".join(filter(str.isdigit, rec_exp))
+            clean_real_exp = "".join(filter(str.isdigit, real_exp))
+            if clean_rec_exp and clean_real_exp and clean_rec_exp == clean_real_exp:
+                score += 2
+                
+        # 3.5 薪资期望匹配
+        rec_salary = rec.get("candidate_salary")
+        real_salary = profile_data.get("salary")
+        if rec_salary and real_salary:
+            clean_rec_sal = rec_salary.lower().replace("元", "").replace("薪", "").strip()
+            clean_real_sal = real_salary.lower().replace("元", "").replace("薪", "").strip()
+            if clean_rec_sal == clean_real_sal or clean_rec_sal in clean_real_sal or clean_real_sal in clean_rec_sal:
+                score += 2
+                
+        # 3.6 最近公司匹配
+        rec_company = rec.get("candidate_company")
+        real_company = profile_data.get("company")
+        if rec_company and real_company:
+            if rec_company in real_company or real_company in rec_company:
+                score += 3
+                
+        # 3.7 职位/标题匹配
+        rec_title = rec.get("candidate_title")
+        real_title = profile_data.get("title")
+        if rec_title and real_title:
+            if rec_title in real_title or real_title in rec_title:
+                score += 3
+
+        # 必须满足最低总分 12 分（姓氏匹配10分 + 至少有一项其他背景契合或关联同一个岗位）
+        if score >= 12:
+            if score > best_score:
+                best_score = score
+                best_match = rec
+            elif score == best_score:
+                # 相同分数时，选择创建时间较新的记录
+                if best_match and rec.get("created_at", "") > best_match.get("created_at", ""):
+                    best_match = rec
+                elif not best_match:
+                    best_match = rec
+
+    return best_match
 
 
 async def link_recommendation_to_candidate(recommendation_id: int, candidate_id: int):
@@ -405,6 +625,76 @@ async def get_greeting_stats() -> dict:
                 "scanned": total_scanned,
                 "matched": total_matched,
             },
+        }
+    finally:
+        await db.close()
+
+
+async def get_daily_stats() -> dict:
+    """获取今日的统计数据"""
+    from datetime import date
+    today = date.today().isoformat()
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT messages_received, replies_sent, resumes_collected, errors,
+                      greetings_sent, greetings_followed_up, greetings_replied,
+                      candidates_scanned, candidates_matched
+               FROM daily_stats WHERE date = ?""",
+            (today,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            return dict(row)
+        else:
+            return {
+                "messages_received": 0,
+                "replies_sent": 0,
+                "resumes_collected": 0,
+                "errors": 0,
+                "greetings_sent": 0,
+                "greetings_followed_up": 0,
+                "greetings_replied": 0,
+                "candidates_scanned": 0,
+                "candidates_matched": 0,
+            }
+    finally:
+        await db.close()
+
+
+async def get_greeting_history_paginated(page: int = 1, limit: int = 15, status_filter: str = 'sent') -> dict:
+    """获取打招呼历史记录的分页版本，返回列表、总数和页数"""
+    db = await get_db()
+    offset = (page - 1) * limit
+    try:
+        if status_filter == 'all':
+            where_clause = "status != 'filtered' OR created_at >= datetime('now', '-2 days', 'localtime')"
+        elif status_filter == 'sent':
+            where_clause = "status IN ('sent', 'followed_up', 'replied')"
+        elif status_filter == 'pending':
+            where_clause = "status = 'pending'"
+        elif status_filter == 'filtered':
+            where_clause = "status = 'filtered' AND created_at >= datetime('now', '-2 days', 'localtime')"
+        else:
+            where_clause = "status != 'filtered' OR created_at >= datetime('now', '-2 days', 'localtime')"
+
+        count_query = f"SELECT COUNT(*) FROM recommendations WHERE {where_clause}"
+        data_query = f"SELECT * FROM recommendations WHERE {where_clause} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+
+        cursor = await db.execute(count_query)
+        count_row = await cursor.fetchone()
+        total_count = count_row[0] if count_row else 0
+
+        cursor = await db.execute(data_query, (limit, offset))
+        rows = await cursor.fetchall()
+        greetings = [dict(row) for row in rows]
+
+        return {
+            "greetings": greetings,
+            "total": total_count,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total_count + limit - 1) // limit if limit > 0 else 1
         }
     finally:
         await db.close()

@@ -66,24 +66,29 @@ async def handle_incoming_message(
         finally:
             await db.close()
 
-    # 2.2 联动打招呼与推荐逻辑：若有姓名，绑定 recommendation 与 candidate 记录，并联动更新回复状态
+    # 2.2 联动打招呼与推荐逻辑：若有姓名，绑定 recommendation 与 candidate 记录，并联动更新回复状态 (使用多维度模糊匹配)
     if candidate_name:
         db = await get_db()
         try:
-            # 1. 查找此候选人最新的推荐/打招呼记录 (未绑定过 candidate_id 优先)
-            cursor = await db.execute(
-                """SELECT id, status FROM recommendations
-                   WHERE candidate_name = ?
-                   ORDER BY (CASE WHEN candidate_id IS NULL THEN 1 ELSE 0 END) DESC, created_at DESC LIMIT 1""",
-                (candidate_name,),
-            )
-            row = await cursor.fetchone()
-            if row:
-                rec_id, status = row[0], row[1]
-                # 绑定 candidate_id
+            from db.database import find_matching_recommendation
+            # 构造多维度匹配参数
+            profile_data = {
+                "name": candidate_name,
+                "title": candidate.get("current_title"),
+                "experience": f"{candidate.get('experience_years')}年" if candidate.get("experience_years") else None,
+                "company": job_context.get("company") if job_context else None,
+            }
+            job_post_id = job_info.get("id") if job_info else None
+            
+            rec_row = await find_matching_recommendation(db, candidate_id, profile_data, job_post_id)
+            if rec_row:
+                rec_id = rec_row["id"]
+                status = rec_row["status"]
+                
+                # 绑定 candidate_id 并将名称更新为真名
                 await db.execute(
-                    "UPDATE recommendations SET candidate_id = ? WHERE id = ?",
-                    (candidate_id, rec_id),
+                    "UPDATE recommendations SET candidate_id = ?, candidate_name = ? WHERE id = ?",
+                    (candidate_id, candidate_name, rec_id),
                 )
                 
                 # 2. 如果之前是已发送状态，候选人发来消息，说明回复了，更新为 replied
@@ -133,12 +138,34 @@ async def handle_incoming_message(
     elif job_info:
         logger.info(f"使用数据库岗位信息: {job_info.get('title', '未知')}")
 
+    # 6.1 获取候选人的来源和匹配得分
+    source = "chat"
+    match_score = None
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """SELECT source, match_score FROM recommendations 
+               WHERE candidate_id = ? 
+               ORDER BY created_at DESC LIMIT 1""",
+            (candidate_id,)
+        )
+        row = await cursor.fetchone()
+        if row:
+            source = row["source"]
+            match_score = row["match_score"]
+    except Exception as e:
+        logger.error(f"获取候选人来源和匹配评分失败: {e}")
+    finally:
+        await db.close()
+
     # 7. 构建 Prompt 并调用 LLM
     prompt_messages = build_chat_prompt(
         conversation_history=history,
         new_message=message,
         job_info=job_info,
         candidate_info=candidate,
+        source=source,
+        match_score=match_score,
     )
 
     result = await llm_engine.generate_reply(prompt_messages)
@@ -166,48 +193,73 @@ async def handle_incoming_message(
 
 def detect_resume_signal(message: str) -> bool:
     """检测消息中是否包含简历相关信号"""
+    message_lower = message.lower()
+
+    # 1. 强信号：Boss直聘官方的附件简历发送请求卡片
+    if "想发送附件简历给您" in message_lower or "发送了附件简历" in message_lower:
+        return True
+
+    # 2. 基础简历关键词
     resume_keywords = [
         "简历", "resume", "cv", "附件", "发给你",
         "已发", "查收", "看一下", "PDF", "pdf",
         "word", "doc", "附上",
     ]
-    message_lower = message.lower()
-    return any(kw in message_lower for kw in resume_keywords)
+
+    has_keyword = any(kw in message_lower for kw in resume_keywords)
+    if not has_keyword:
+        return False
+
+    # 3. 排除否定词或延迟词（如：“晚点发”、“等会发”、“没带简历”、“准备发”）
+    negation_keywords = ["晚点", "稍后", "等会", "等一下", "没带", "没有", "空了", "迟些", "准备发"]
+    if any(neg in message_lower for neg in negation_keywords):
+        return False
+
+    return True
 
 
 async def notify_resume_received(candidate: dict, message: str):
-    """通过企业微信通知猎头：收到简历"""
-    if not settings.WECHAT_WEBHOOK_URL:
+    """通知猎头：收到简历"""
+    if not settings.WECHAT_WEBHOOK_URL and not settings.DINGTALK_WEBHOOK_URL:
         return
 
+    candidate_name = candidate.get('name', candidate['boss_chat_id'])
     content = (
-        f"🎉 **收到简历！**\n"
-        f"- 候选人: {candidate.get('name', candidate['boss_chat_id'])}\n"
+        f"🎉 **收到简历！**\n\n"
+        f"- 候选人: {candidate_name}\n"
         f"- 消息: {message[:100]}\n"
         f"- 请前往 Boss直聘 查看"
     )
-    await _send_wechat_notification(content)
+
+    if settings.WECHAT_WEBHOOK_URL:
+        await _send_wechat_notification(content)
+
+    if settings.DINGTALK_WEBHOOK_URL:
+        await _send_dingtalk_notification(title="收到简历通知", text=content)
 
 
 async def notify_human_needed(candidate: dict, message: str):
     """通知猎头需要人工介入"""
-    if not settings.WECHAT_WEBHOOK_URL:
+    if not settings.WECHAT_WEBHOOK_URL and not settings.DINGTALK_WEBHOOK_URL:
         return
 
+    candidate_name = candidate.get('name', candidate['boss_chat_id'])
     content = (
-        f"⚠️ **需要人工介入**\n"
-        f"- 候选人: {candidate.get('name', candidate['boss_chat_id'])}\n"
+        f"⚠️ **需要人工介入**\n\n"
+        f"- 候选人: {candidate_name}\n"
         f"- 消息: {message[:100]}\n"
         f"- 请尽快回复"
     )
-    await _send_wechat_notification(content)
+
+    if settings.WECHAT_WEBHOOK_URL:
+        await _send_wechat_notification(content)
+
+    if settings.DINGTALK_WEBHOOK_URL:
+        await _send_dingtalk_notification(title="需要人工介入通知", text=content)
 
 
 async def _send_wechat_notification(content: str):
     """发送企业微信群机器人通知"""
-    if not settings.WECHAT_WEBHOOK_URL:
-        return
-
     payload = {
         "msgtype": "markdown",
         "markdown": {"content": content},
@@ -226,3 +278,49 @@ async def _send_wechat_notification(content: str):
                     logger.warning(f"微信通知失败: status={resp.status}")
     except Exception as e:
         logger.error(f"微信通知异常: {e}")
+
+
+async def _send_dingtalk_notification(title: str, text: str):
+    """发送钉钉群机器人通知"""
+    import time
+    import hmac
+    import hashlib
+    import base64
+    import urllib.parse
+
+    url = settings.DINGTALK_WEBHOOK_URL
+    if settings.DINGTALK_SECRET:
+        timestamp = str(round(time.time() * 1000))
+        secret_enc = settings.DINGTALK_SECRET.encode('utf-8')
+        string_to_sign = '{}\n{}'.format(timestamp, settings.DINGTALK_SECRET)
+        string_to_sign_enc = string_to_sign.encode('utf-8')
+        hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
+        url = f"{url}&timestamp={timestamp}&sign={sign}"
+
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": title,
+            "text": text,
+        }
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    if res_json.get("errcode") == 0:
+                        logger.info("钉钉通知发送成功")
+                    else:
+                        logger.warning(f"钉钉通知发送失败(API返回错误): {res_json}")
+                else:
+                    res_body = await resp.text()
+                    logger.warning(f"钉钉通知接口请求失败: status={resp.status}, body={res_body}")
+    except Exception as e:
+        logger.error(f"钉钉通知发送异常: {e}")

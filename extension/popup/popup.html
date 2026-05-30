@@ -55,16 +55,35 @@
       </div>
     </section>
 
-    <!-- 主动打招呼 -->
-    <section class="greeting-section">
-      <div class="section-header-row">
-        <h2 class="section-title">主动打招呼</h2>
-        <div class="quota-badge" id="greetQuota">0/20</div>
+    <!-- DOM 校准状态 -->
+    <section class="calibration-section">
+      <h2 class="section-title">📡 DOM 校准</h2>
+      <div class="calibration-grid">
+        <div class="cal-item" id="calRowJobSyncer">
+          <span class="cal-dot" id="calDotJobSyncer">⏳</span>
+          <span class="cal-label">职位同步</span>
+          <span class="cal-status" id="calStatusJobSyncer">未检测</span>
+          <button class="cal-btn" id="calBtnJobSyncer" title="校准职位同步模块">校准</button>
+        </div>
+        <div class="cal-item" id="calRowRecommend">
+          <span class="cal-dot" id="calDotRecommend">⏳</span>
+          <span class="cal-label">推荐牛人</span>
+          <span class="cal-status" id="calStatusRecommend">未检测</span>
+          <button class="cal-btn" id="calBtnRecommend" title="校准推荐牛人模块">校准</button>
+        </div>
+        <div class="cal-item" id="calRowChatObserver">
+          <span class="cal-dot" id="calDotChatObserver">⏳</span>
+          <span class="cal-label">聊天列表</span>
+          <span class="cal-status" id="calStatusChatObserver">未检测</span>
+          <button class="cal-btn" id="calBtnChatObserver" title="校准聊天列表模块">校准</button>
+        </div>
+        <div class="cal-item" id="calRowChatConversation">
+          <span class="cal-dot" id="calDotChatConversation">⏳</span>
+          <span class="cal-label">聊天对话</span>
+          <span class="cal-status" id="calStatusChatConversation">未检测</span>
+          <button class="cal-btn" id="calBtnChatConversation" title="在已点开候选人对话时校准">校准</button>
+        </div>
       </div>
-      <p id="greetStatus" class="status-text">今日未开始</p>
-      <button id="btnStartScan" class="btn btn-accent">
-        🔍 扫描推荐牛人
-      </button>
     </section>
 
     <!-- 运行时长 -->

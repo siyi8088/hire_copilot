@@ -10,9 +10,20 @@
 
   const LOG_PREFIX = '[HireCopilot:JobSyncer]';
   const VERSION = '0.2.0';
+  const MODULE_NAME = 'jobSyncer';
 
   let syncOverlay = null;
   let panelDismissed = false;
+  let preflightResult = null;
+
+  // ============================================================
+  // DOM 选择器 — 从 SelectorRegistry + PreflightCheck 动态获取
+  // ============================================================
+  function SEL(name) {
+    const val = window.PreflightCheck.getSelector(MODULE_NAME, name);
+    if (typeof val === 'string') return [val];
+    return val || [];
+  }
 
   // ============================================================
   // UI 样式注入
@@ -328,15 +339,7 @@
    * 自动寻找所有的“开放中”岗位卡片
    */
   function findActiveJobCards() {
-    const cardSelectors = [
-      'div.job-item',
-      'div.job-card',
-      'div[class*="job-card"]',
-      'div[class*="job-item"]',
-      'div[class*="position-item"]',
-      'li.job-card',
-      '.job-list-item'
-    ];
+    const cardSelectors = SEL('JOB_CARD');
 
     let cardElements = [];
     for (const sel of cardSelectors) {
@@ -390,9 +393,11 @@
     // 1. 尝试通过“三个点 ➔ 预览”的交互链，打开“静态预览弹窗”（此方式速度最快，且不涉及SPA页面跳转或表单输入）
     try {
       // 优先精确定位三个点图标/按钮，并发起 mouseenter / mouseover 事件，模拟悬停以防有悬浮处理
-      let moreBtn = cardEl.querySelector('.dot');
-      if (!moreBtn) {
-        moreBtn = cardEl.querySelector('.more-operate, [class*="more-operate"]');
+      const moreBtnCandidates = SEL('MORE_OPERATE_BTN');
+      let moreBtn = null;
+      for (const sel of moreBtnCandidates) {
+        moreBtn = cardEl.querySelector(sel);
+        if (moreBtn) break;
       }
       if (moreBtn) {
         console.log(`${LOG_PREFIX} 模拟悬停与点击三个点按钮以激活状态...`);
@@ -404,7 +409,8 @@
 
       // 无论下拉菜单当前在 CSS 中是否可见，HTML 结构显示下拉项已经在 cardEl DOM 内。
       // 直接定位 cardEl 内部文本为“预览”的元素并进行点击。
-      const previewItems = [...cardEl.querySelectorAll('.job-operate-item, .job-operate-container li, li, a, span')];
+      const operateItemSels = SEL('OPERATE_MENU_ITEM');
+      const previewItems = operateItemSels.flatMap(sel => [...cardEl.querySelectorAll(sel)]);
       const previewItem = previewItems.find(el => el.textContent?.trim() === '预览');
 
       if (previewItem) {
@@ -474,38 +480,7 @@
    */
   function findPreviewContainer() {
     // 扩展选择器，覆盖更多可能的抽屉/对话框/详情容器，并支持更多 HTML5 语义标签
-    const selectors = [
-      'div[class*="drawer"]',
-      'section[class*="drawer"]',
-      'aside[class*="drawer"]',
-      'div[class*="dialog"]',
-      'div[class*="modal"]',
-      'div[class*="detail"]',
-      'section[class*="detail"]',
-      'aside[class*="detail"]',
-      'div[class*="preview"]',
-      'section[class*="preview"]',
-      'div[class*="popup"]',
-      'div[class*="aside"]',
-      'div[class*="pane"]',
-      'div[class*="panel"]',
-      'div[class*="wrap"]',
-      '.detail-dialog',
-      '.job-detail-box',
-      '.job-detail-dialog',
-      '.job-detail-drawer',
-      '.job-drawer',
-      '.job-preview',
-      '.preview-drawer',
-      '.preview-box',
-      '.preview-container',
-      '.detail-box',
-      '.detail-container',
-      '.chat-right',
-      '.job-detail',
-      '.chat-detail',
-      '.chat-info'
-    ];
+    const selectors = SEL('PREVIEW_CONTAINER');
 
     console.log(`${LOG_PREFIX} 正在查找详情预览容器...`);
 
@@ -773,7 +748,12 @@
    */
   async function closeJobPreview(previewEl) {
     if (!previewEl) return;
-    const closeBtn = previewEl.querySelector('button[class*="close"], span[class*="close"], a[class*="close"], [class*="icon-close"], .close');
+    const closeBtnCandidates = SEL('PREVIEW_CLOSE_BTN');
+    let closeBtn = null;
+    for (const sel of closeBtnCandidates) {
+      closeBtn = previewEl.querySelector(sel);
+      if (closeBtn) break;
+    }
     if (closeBtn) {
       console.log(`${LOG_PREFIX} 点击关闭按钮`);
       closeBtn.click();
@@ -886,7 +866,7 @@
       // 提取所有活跃岗位信息作为兜底数据
       const cardDatas = activeCards.map((card, idx) => {
         let title = '';
-        const titleSelectors = ['.job-title', '.job-name', '.name', 'span.name', 'a.job-name', 'h3', 'div.title', 'span'];
+        const titleSelectors = SEL('JOB_CARD_TITLE');
         for (const sel of titleSelectors) {
           const el = card.querySelector(sel);
           if (el && el.textContent?.trim()) {
@@ -1094,8 +1074,20 @@
   // ============================================================
   // 初始化
   // ============================================================
-  function init() {
+  async function init() {
     console.log(`${LOG_PREFIX} v${VERSION} 已加载`);
+
+    // ★ Preflight Check — 校准 DOM 选择器
+    if (window.PreflightCheck) {
+      preflightResult = await window.PreflightCheck.run(MODULE_NAME);
+      if (!preflightResult.passed) {
+        console.error(`${LOG_PREFIX} ❌ DOM 校准失败，业务逻辑已暂停`);
+        // 校准失败时仍然显示同步面板，但点击同步时提示校准失败
+      } else {
+        console.log(`${LOG_PREFIX} ✅ DOM 校准通过${preflightResult.fromCache ? ' (缓存)' : ''}`);
+      }
+    }
+
     checkRoute();
     setInterval(checkRoute, 1000);
   }

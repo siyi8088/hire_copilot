@@ -275,6 +275,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // ---- 自动采集微简历画像 ----
+  if (msg.type === 'UPDATE_CANDIDATE_PROFILE') {
+    sendToBackend({
+      type: 'UPDATE_CANDIDATE_PROFILE',
+      chatId: msg.payload.chatId,
+      profileData: msg.payload.profileData,
+    })
+      .then(response => sendResponse(response))
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 转发微简历画像失败:`, err);
+        sendResponse({ ok: false, error: err.message });
+      });
+    return true; // 异步 response
+  }
+
+  // ---- 在线简历完整解析上报 ----
+  if (msg.type === 'UPDATE_CANDIDATE_RESUME') {
+    sendToBackend({
+      type: 'UPDATE_CANDIDATE_RESUME',
+      chatId: msg.payload.chatId,
+      name: msg.payload.name,
+      resumeText: msg.payload.resumeText,
+    })
+      .then(response => sendResponse(response))
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 转发在线简历失败:`, err);
+        sendResponse({ ok: false, error: err.message });
+      });
+    return true; // 异步 response
+  }
+
+  // ---- 检查候选人是否被评估过 ----
+  if (msg.type === 'CHECK_EVALUATED') {
+    const url = `http://127.0.0.1:8765/api/candidates/check_evaluated?chat_id=${encodeURIComponent(msg.payload.chatId)}&name=${encodeURIComponent(msg.payload.name)}`;
+    fetch(url)
+      .then(res => res.json())
+      .then(data => sendResponse({ evaluated: data.evaluated, has_messages: data.has_messages }))
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 检查候选人评估状态失败:`, err);
+        sendResponse({ evaluated: false, has_messages: false });
+      });
+    return true; // 异步 response
+  }
+
+  // ---- Preflight Check：截图 ----
+  if (msg.type === 'CAPTURE_SCREENSHOT') {
+    chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
+      if (chrome.runtime.lastError) {
+        console.warn(`${LOG_PREFIX} 截图失败:`, chrome.runtime.lastError.message);
+        sendResponse({ screenshot: null, error: chrome.runtime.lastError.message });
+      } else {
+        sendResponse({ screenshot: dataUrl });
+      }
+    });
+    return true; // 异步 sendResponse
+  }
+
+  // ---- Preflight Check：诊断上报（走 HTTP，避免大包阻塞 WS）----
+  if (msg.type === 'REPORT_DIAGNOSTIC') {
+    fetch('http://127.0.0.1:8765/api/diagnostic', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg.payload),
+    })
+      .then(res => res.json())
+      .then(data => {
+        console.log(`${LOG_PREFIX} 诊断数据上报成功:`, data);
+        sendResponse(data);
+      })
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 诊断数据上报失败:`, err);
+        sendResponse({ ok: false, error: err.message });
+      });
+    return true; // 异步 sendResponse
+  }
+
+  if (msg.type === 'GET_DAILY_STATS') {
+    fetch('http://127.0.0.1:8765/api/stats/daily')
+      .then(res => res.json())
+      .then(data => sendResponse(data))
+      .catch(err => {
+        console.error(`${LOG_PREFIX} 获取今日统计数据失败:`, err);
+        sendResponse({ ok: false, error: err.message });
+      });
+    return true; // 异步 response
+  }
+
   if (msg.type === 'GET_CONNECTION_STATUS') {
     sendResponse({
       connected: ws?.readyState === WebSocket.OPEN,

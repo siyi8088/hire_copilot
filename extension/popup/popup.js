@@ -14,40 +14,72 @@ document.addEventListener('DOMContentLoaded', () => {
   const currentChat = document.getElementById('currentChat');
   const btnReconnect = document.getElementById('btnReconnect');
   const btnOpenDashboard = document.getElementById('btnOpenDashboard');
-  const btnStartScan = document.getElementById('btnStartScan');
-  const greetQuota = document.getElementById('greetQuota');
-  const greetStatus = document.getElementById('greetStatus');
+
+  // 校准模块配置
+  const CAL_MODULES = {
+    jobSyncer: {
+      dot: document.getElementById('calDotJobSyncer'),
+      status: document.getElementById('calStatusJobSyncer'),
+      btn: document.getElementById('calBtnJobSyncer'),
+      urlPattern: 'https://www.zhipin.com/web/chat/job/list*',
+      pageUrl: 'https://www.zhipin.com/web/chat/job/list',
+      label: '职位同步',
+    },
+    recommendGreeter: {
+      dot: document.getElementById('calDotRecommend'),
+      status: document.getElementById('calStatusRecommend'),
+      btn: document.getElementById('calBtnRecommend'),
+      urlPattern: 'https://www.zhipin.com/web/chat/recommend*',
+      pageUrl: 'https://www.zhipin.com/web/chat/recommend',
+      label: '推荐牛人',
+    },
+    chatObserver: {
+      dot: document.getElementById('calDotChatObserver'),
+      status: document.getElementById('calStatusChatObserver'),
+      btn: document.getElementById('calBtnChatObserver'),
+      urlPattern: 'https://www.zhipin.com/web/chat/index*',
+      pageUrl: 'https://www.zhipin.com/web/chat/index',
+      label: '聊天列表',
+    },
+    chatConversation: {
+      dot: document.getElementById('calDotChatConversation'),
+      status: document.getElementById('calStatusChatConversation'),
+      btn: document.getElementById('calBtnChatConversation'),
+      urlPattern: 'https://www.zhipin.com/web/chat/index*',
+      pageUrl: 'https://www.zhipin.com/web/chat/index',
+      label: '聊天对话',
+    },
+  };
 
   // ---- 初始化 ----
   init();
 
   async function init() {
-    // 动态设置版本号
     const versionText = document.getElementById('versionText');
     if (versionText) {
       versionText.textContent = `v${chrome.runtime.getManifest().version}`;
     }
 
-    // 读取开关状态
     const stored = await chrome.storage.local.get(['copilotEnabled']);
     toggleEnabled.checked = stored.copilotEnabled || false;
     updateStatusText(toggleEnabled.checked);
 
-    // 查询后端连接状态
     checkConnection();
-
-    // 查询 content script 状态
     refreshStats();
+    refreshCalibrationStatus();
 
-    // 刷新打招呼配额
-    refreshGreetingQuota();
+    // 绑定每个模块的校准按钮
+    for (const [modName, mod] of Object.entries(CAL_MODULES)) {
+      if (mod.btn) {
+        mod.btn.addEventListener('click', () => handleCalibrate(modName));
+      }
+    }
 
-    // 定时刷新
     setInterval(() => {
       checkConnection();
       refreshStats();
-      refreshGreetingQuota();
-    }, 3000);
+      refreshCalibrationStatus();
+    }, 5000);
   }
 
   // ---- 开关 ----
@@ -56,17 +88,13 @@ document.addEventListener('DOMContentLoaded', () => {
     await chrome.storage.local.set({ copilotEnabled: enabled });
     updateStatusText(enabled);
 
-    // 通知当前活动的 Boss 直聘标签页
     const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/*', active: true });
     for (const tab of tabs) {
       try {
         await chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_ENABLED', enabled });
-      } catch (e) {
-        // tab 可能没有 content script
-      }
+      } catch (e) {}
     }
 
-    // 如果没有活跃的标签页，也通知所有 Boss 标签
     if (tabs.length === 0) {
       const allTabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/*' });
       for (const tab of allTabs) {
@@ -106,72 +134,157 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // ---- 刷新统计数据 ----
   async function refreshStats() {
+    // 1. 优先从后台获取真实的数据库统计数据
+    let backendStatsLoaded = false;
+    try {
+      const response = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'GET_DAILY_STATS' }, (res) => {
+          if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+          else resolve(res);
+        });
+      });
+      if (response?.ok && response.stats) {
+        const s = response.stats;
+        statReceived.textContent = s.messages_received ?? 0;
+        statReplied.textContent = s.replies_sent ?? 0;
+        statResumes.textContent = s.resumes_collected ?? 0;
+        statErrors.textContent = s.errors ?? 0;
+        backendStatsLoaded = true;
+      }
+    } catch (e) {
+      console.warn("无法从后端获取统计数据，将降级使用页面本地统计:", e);
+    }
+
+    // 2. 从活跃的 Boss 标签页获取运行时长和当前聊天（非持久化状态）
     const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/*' });
     for (const tab of tabs) {
       try {
         const response = await chrome.tabs.sendMessage(tab.id, { type: 'GET_STATUS' });
         if (response?.ok) {
           const s = response.stats;
-          statReceived.textContent = s.messagesReceived || 0;
-          statReplied.textContent = s.repliesSent || 0;
-          statErrors.textContent = s.errors || 0;
+          
+          // 如果后端统计加载失败，降级使用页面内存统计
+          if (!backendStatsLoaded && s) {
+            statReceived.textContent = s.messagesReceived || 0;
+            statReplied.textContent = s.repliesSent || 0;
+            statErrors.textContent = s.errors || 0;
+            statResumes.textContent = 0; // 页面本地无此统计
+          }
 
-          // 运行时长
-          if (s.startTime) {
+          if (s?.startTime) {
             const elapsed = Date.now() - s.startTime;
             runtime.textContent = formatDuration(elapsed);
           }
 
-          // 当前聊天
           currentChat.textContent = response.currentChatId
             ? response.currentChatId.substring(0, 15) + '...'
             : '无';
 
-          break; // 只取第一个标签页的数据
+          break;
         }
       } catch (e) {}
     }
   }
 
-  // ---- 刷新打招呼配额 ----
-  async function refreshGreetingQuota() {
-    // 从推荐牛人页面获取
-    const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/web/chat/recommend*' });
-    for (const tab of tabs) {
-      try {
-        const response = await chrome.tabs.sendMessage(tab.id, { type: 'GET_GREETING_STATUS' });
-        if (response?.ok) {
-          const q = response.quota || {};
-          greetQuota.textContent = `${q.used || 0}/${q.limit || 20}`;
+  // ---- 刷新校准状态 ----
+  async function refreshCalibrationStatus() {
+    const CACHE_TTL = 24 * 60 * 60 * 1000;
 
-          // 更新状态文本
-          if (response.phase === 'scanning') {
-            greetStatus.textContent = '🔍 正在扫描候选人...';
-            greetStatus.style.color = '#feca57';
-          } else if (response.phase === 'evaluating') {
-            greetStatus.textContent = '🤖 AI 评估中...';
-            greetStatus.style.color = '#a29bfe';
-          } else if (response.phase === 'reviewing') {
-            greetStatus.textContent = '📋 请在推荐牛人页面审核';
-            greetStatus.style.color = '#00cec9';
-          } else if (response.phase === 'greeting') {
-            greetStatus.textContent = `👋 打招呼中 (${response.stats?.greeted || 0}/${response.stats?.approved || 0})`;
-            greetStatus.style.color = '#6c5ce7';
-          } else if (response.phase === 'done') {
-            greetStatus.textContent = `✅ 今日已完成 ${q.used || 0} 个`;
-            greetStatus.style.color = '#00cec9';
-          } else {
-            greetStatus.textContent = '就绪 — 点击下方按钮开始';
-            greetStatus.style.color = '#8888a8';
-          }
-          return;
+    for (const [modName, mod] of Object.entries(CAL_MODULES)) {
+      if (!mod.dot || !mod.status || !mod.btn) continue;
+
+      // 检查是否有对应页面的标签页打开
+      const tabs = await chrome.tabs.query({ url: mod.urlPattern });
+      const hasTab = tabs.length > 0;
+
+      // 读取缓存
+      const cacheKey = `preflight_cache_${modName}`;
+      const stored = await chrome.storage.local.get([cacheKey]);
+      const cache = stored[cacheKey];
+
+      if (!cache) {
+        mod.dot.textContent = '⏳';
+        mod.status.textContent = '未检测';
+        mod.status.className = 'cal-status';
+      } else if (Date.now() - cache._timestamp > CACHE_TTL) {
+        mod.dot.textContent = '⚠️';
+        mod.status.textContent = '已过期';
+        mod.status.className = 'cal-status failed';
+      } else {
+        const results = cache.results || {};
+        const failedCritical = Object.entries(results).some(
+          ([, r]) => r.critical && !r.passed
+        );
+
+        if (failedCritical) {
+          mod.dot.textContent = '🔴';
+          mod.status.textContent = '校准失败';
+          mod.status.className = 'cal-status failed';
+        } else {
+          const passedCount = Object.values(results).filter(r => r.passed).length;
+          const totalCount = Object.keys(results).length;
+          mod.dot.textContent = '🟢';
+          mod.status.textContent = `${passedCount}/${totalCount} 通过`;
+          mod.status.className = 'cal-status passed';
         }
-      } catch (e) {}
+      }
+
+      // 更新按钮状态
+      if (hasTab) {
+        mod.btn.textContent = '校准';
+        mod.btn.className = 'cal-btn';
+        mod.btn.title = `在当前打开的${mod.label}页面上执行校准`;
+      } else {
+        mod.btn.textContent = '前往';
+        mod.btn.className = 'cal-btn btn-go';
+        mod.btn.title = `打开${mod.label}页面`;
+      }
+    }
+  }
+
+  // ---- 单模块校准 ----
+  async function handleCalibrate(modName) {
+    const mod = CAL_MODULES[modName];
+    if (!mod) return;
+
+    const tabs = await chrome.tabs.query({ url: mod.urlPattern });
+
+    if (tabs.length === 0) {
+      // 没有对应页面，打开它
+      chrome.tabs.create({ url: mod.pageUrl });
+      mod.status.textContent = '正在打开...';
+      mod.status.className = 'cal-status';
+      return;
     }
 
-    // 没有打开推荐牛人页面
-    greetStatus.textContent = '请先打开推荐牛人页面';
-    greetStatus.style.color = '#8888a8';
+    // 有对应页面，触发校准
+    const tab = tabs[0];
+    mod.btn.disabled = true;
+    mod.btn.textContent = '⏳';
+    mod.dot.textContent = '🔄';
+    mod.status.textContent = '校准中...';
+    mod.status.className = 'cal-status';
+
+    // 清除该模块的缓存
+    const cacheKey = `preflight_cache_${modName}`;
+    await chrome.storage.local.remove([cacheKey]);
+
+    try {
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'FORCE_RECALIBRATE',
+        moduleName: modName,
+        forceReport: true, // 手动点击校准时，强制生成并上报诊断文档
+      });
+    } catch (e) {
+      mod.status.textContent = '⚠️ 页面无响应';
+      mod.status.className = 'cal-status failed';
+    }
+
+    // 延迟刷新状态
+    setTimeout(() => {
+      mod.btn.disabled = false;
+      refreshCalibrationStatus();
+    }, 3000);
   }
 
   function formatDuration(ms) {
@@ -201,31 +314,4 @@ document.addEventListener('DOMContentLoaded', () => {
   btnOpenDashboard.addEventListener('click', () => {
     chrome.tabs.create({ url: 'http://127.0.0.1:8765/dashboard' });
   });
-
-  // ---- 扫描推荐牛人 ----
-  btnStartScan.addEventListener('click', async () => {
-    // 检查是否有推荐牛人页面打开
-    const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/web/chat/recommend*' });
-
-    if (tabs.length === 0) {
-      // 没有打开，自动打开
-      chrome.tabs.create({ url: 'https://www.zhipin.com/web/chat/recommend' });
-      greetStatus.textContent = '🚀 正在打开推荐牛人页面...';
-      greetStatus.style.color = '#feca57';
-      return;
-    }
-
-    // 已打开，通知 content script 开始扫描
-    const tab = tabs[0];
-    chrome.tabs.update(tab.id, { active: true }); // 切到该标签页
-    try {
-      await chrome.tabs.sendMessage(tab.id, { type: 'START_GREETING_SCAN' });
-      greetStatus.textContent = '🔍 扫描已启动，请切到推荐牛人页面';
-      greetStatus.style.color = '#feca57';
-    } catch (e) {
-      greetStatus.textContent = '⚠️ 无法连接页面，请刷新后重试';
-      greetStatus.style.color = '#ff6b6b';
-    }
-  });
 });
-

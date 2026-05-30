@@ -77,6 +77,8 @@ def build_chat_prompt(
     new_message: str,
     job_info: dict | None = None,
     candidate_info: dict | None = None,
+    source: str = "chat",
+    match_score: float | None = None,
 ) -> list[dict]:
     """
     构建完整的 Chat Prompt
@@ -86,6 +88,8 @@ def build_chat_prompt(
         new_message: 候选人的新消息
         job_info: 当前活跃岗位信息
         candidate_info: 候选人已知信息
+        source: 候选人来源 (recommend / chat)
+        match_score: 候选人在线简历匹配得分
 
     Returns:
         OpenAI 格式的 messages 列表
@@ -110,11 +114,26 @@ def build_chat_prompt(
         name = candidate_info.get("name", "未知")
         title = candidate_info.get("current_title", "未知")
         status = candidate_info.get("status", "new")
+        
+        # 对话及引导策略指示
+        if source == "recommend":
+            strategy = "该候选人来自【推荐牛人】渠道，我们已在推荐列表对他的在线简历完成过评估打分（分值较高才主动打招呼）。当前你的核心目标是【引导、说服对方提供附件简历，或者索要联系方式（如微信）以便发送详细JD】。请注意：绝对不要再向该候选人索要或评估其在线简历！"
+        else: # source == "chat"
+            if match_score is None:
+                strategy = "该候选人是【主动打招呼】进入对话的，目前我们尚未采集到他的在线简历，也没有进行评分评估。你的核心目标是【说服或引导该候选人提供、开放、分享其在线简历以供我们评估】。请注意：在没有拿到在线简历及评估分数之前，绝对不要向其索要附件简历或微信联系方式！"
+            elif match_score < 6.5: # 达标分为 6.5 分
+                strategy = f"该候选人是【主动打招呼】进入对话的，我们已对其在线简历完成评估，得分为 {match_score} 分（未达到 6.5 的达标分，背景不符合要求）。你的核心目标是【委婉、礼貌地拒绝该候选人，表达背景与岗位不完全匹配，并祝愿其求职顺利】。请注意：绝对不能索要对方的附件简历或微信！"
+            else:
+                strategy = f"该候选人是【主动打招呼】进入对话的，我们已对其在线简历完成评估，得分为 {match_score} 分（已达到 6.5 的达标分，背景符合要求）。你的核心目标是【引导、说服对方提供附件简历，或者索要联系方式（如微信）以便发送详细JD】。"
+
         cand_context = f"""
 ## 候选人信息
 - 称呼：{name}
 - 当前职位：{title}
 - 对话状态：{status}
+- 候选人来源渠道：{"推荐牛人" if source == "recommend" else "主动打招呼"}
+- 在线简历大模型评估分数：{f"{match_score} 分 (满分 10 分)" if match_score is not None else "尚未获取/尚未评估"}
+- 针对该候选人的对话策略指示：{strategy}
 """
         messages[0]["content"] += cand_context
 

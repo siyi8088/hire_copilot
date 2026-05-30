@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     # ---- 微信通知 ----
     WECHAT_WEBHOOK_URL: Optional[str] = None  # 企业微信群机器人 Webhook
 
+    # ---- 钉钉通知 ----
+    DINGTALK_WEBHOOK_URL: Optional[str] = None  # 钉钉群机器人 Webhook
+    DINGTALK_SECRET: Optional[str] = None  # 钉钉群机器人安全密钥 (可选加签)
+
     # ---- 数据库 ----
     DB_PATH: str = "data/copilot.db"
 

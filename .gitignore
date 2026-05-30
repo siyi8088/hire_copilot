@@ -59,9 +59,14 @@ Thumbs.db
 # Log files
 *.log
 **/logs/
+**/backend/data/diagnostics
 
 # Node/JS (in case node_modules are added)
 **/node_modules/
 **/npm-debug.log*
 **/yarn-debug.log*
 **/yarn-error.log*
+
+# Chrome test/profile directories
+chrome-profile/
+

@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from config import settings
-from db.database import init_db, get_active_job_post, get_greeting_history, get_greeting_stats, save_or_update_job_post
+from db.database import init_db, get_active_job_post, get_greeting_history, get_greeting_stats, save_or_update_job_post, get_db
 from services.chat_handler import handle_incoming_message
 from services.rate_limiter import rate_limiter
 from services.greeting_handler import (
@@ -222,6 +222,46 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
+            # ---- 自动采集微简历画像 ----
+            if message.get("type") == "UPDATE_CANDIDATE_PROFILE":
+                request_id = message.get("requestId")
+                chat_id = message.get("chatId")
+                profile_data = message.get("profileData", {})
+                logger.info(f"👤 收到候选人画像更新 [{chat_id}] (姓名: {profile_data.get('name')}): {profile_data}")
+                
+                from db.database import update_candidate_profile
+                await update_candidate_profile(chat_id, profile_data)
+                
+                # 触发异步背景智能评估
+                import asyncio
+                asyncio.create_task(evaluate_chat_candidate_background(chat_id, profile_data))
+                
+                await websocket.send_json({
+                    "requestId": request_id,
+                    "type": "UPDATE_CANDIDATE_PROFILE_RESULT",
+                    "ok": True,
+                })
+                continue
+
+            # ---- 在线简历解析与评估 ----
+            if message.get("type") == "UPDATE_CANDIDATE_RESUME":
+                request_id = message.get("requestId")
+                chat_id = message.get("chatId")
+                candidate_name = message.get("name")
+                resume_text = message.get("resumeText", "")
+                logger.info(f"📄 收到在线简历上报 [{chat_id}] (姓名: {candidate_name}), 长度: {len(resume_text)}")
+                
+                # 异步执行大模型简历评分与评估
+                import asyncio
+                asyncio.create_task(evaluate_candidate_resume_background(chat_id, candidate_name, resume_text))
+                
+                await websocket.send_json({
+                    "requestId": request_id,
+                    "type": "UPDATE_CANDIDATE_RESUME_RESULT",
+                    "ok": True,
+                })
+                continue
+
             logger.warning(f"未知消息类型: {message.get('type')}")
 
     except WebSocketDisconnect:
@@ -229,6 +269,215 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
         manager.disconnect(websocket)
+
+
+async def evaluate_chat_candidate_background(chat_id: str, profile_data: dict):
+    """在后台为新抓取的聊天候选人自动评估并计算匹配分和理由"""
+    import asyncio
+    try:
+        from db.database import get_db, get_active_job_post
+        from services.greeting_handler import _evaluate_batch, _generate_followup
+        
+        # 1. 获取当前活跃岗位
+        job_info = await get_active_job_post()
+        if not job_info:
+            logger.warning("[Evaluator] 无活跃岗位，跳过背景智能评估")
+            return
+            
+        # 2. 检查是否已经有了评估记录
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                """SELECT id, match_score FROM recommendations 
+                   WHERE candidate_name = ? AND source = 'chat' 
+                   ORDER BY created_at DESC LIMIT 1""",
+                (profile_data.get("name"),)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return
+            rec_id = row["id"]
+            # 如果已经有了分数，我们就无需重复生成
+            if row["match_score"] is not None:
+                return
+        finally:
+            await db.close()
+
+        logger.info(f"[Evaluator] 🎯 开始为聊天候选人 {profile_data.get('name')} 执行背景智能评估...")
+
+        eval_input = {
+            "name": profile_data.get("name"),
+            "title": profile_data.get("title") or "未知",
+            "experience": profile_data.get("experience") or "未知",
+            "education": profile_data.get("education") or "未知",
+            "salary": profile_data.get("salary") or "未知",
+            "company": profile_data.get("company") or "",
+        }
+        
+        # 调用大模型评分评估
+        scored_list = await _evaluate_batch([eval_input], job_info)
+        if not scored_list:
+            return
+        scored = scored_list[0]
+        
+        match_score = scored.get("matchScore", 5.0)
+        match_reason = scored.get("matchReason", "评估未返回详细原因")
+        
+        # 生成跟进消息
+        followup_text = await _generate_followup(scored, job_info, match_reason)
+        
+        # 保存回数据库
+        db = await get_db()
+        try:
+            await db.execute(
+                """UPDATE recommendations 
+                   SET match_score = ?, match_reason = ?, followup_text = ?
+                   WHERE id = ?""",
+                (match_score, match_reason, followup_text, rec_id)
+            )
+            await db.commit()
+            logger.info(f"[Evaluator] ✅ 背景智能评估完成: name={profile_data.get('name')}, score={match_score}")
+        finally:
+            await db.close()
+            
+    except Exception as e:
+        logger.error(f"[Evaluator] 背景智能评估异常: {e}")
+
+
+async def evaluate_candidate_resume_background(chat_id: str, candidate_name: str, resume_text: str):
+    """在后台为在线简历文本执行智能匹配评估"""
+    try:
+        from db.database import get_db, get_active_job_post
+        from services.greeting_handler import _evaluate_batch, _generate_followup
+        
+        # 1. 获取当前活跃岗位
+        job_info = await get_active_job_post()
+        if not job_info:
+            logger.warning("[ResumeEvaluator] 无活跃岗位，跳过在线简历评估")
+            return
+            
+        # 2. 获取 recommendations 记录（获取或新建）
+        db = await get_db()
+        try:
+            # 找到对应的 candidate_id
+            cursor = await db.execute("SELECT id FROM candidates WHERE boss_chat_id = ?", (chat_id,))
+            cand_row = await cursor.fetchone()
+            candidate_id = cand_row["id"] if cand_row else None
+            
+            # 查找已有的推荐记录
+            cursor = await db.execute(
+                """SELECT id FROM recommendations 
+                   WHERE candidate_name = ? AND source = 'chat' 
+                   ORDER BY created_at DESC LIMIT 1""",
+                (candidate_name,)
+            )
+            row = await cursor.fetchone()
+            if row:
+                rec_id = row["id"]
+            else:
+                # 自动获取岗位 id
+                job_post_id = job_info.get("id")
+                # 插入全新记录
+                cursor = await db.execute(
+                    """INSERT INTO recommendations 
+                       (candidate_id, candidate_name, source, status, job_post_id)
+                       VALUES (?, ?, 'chat', 'chatting', ?)""",
+                    (candidate_id, candidate_name, job_post_id)
+                )
+                await db.commit()
+                rec_id = cursor.lastrowid
+        finally:
+            await db.close()
+
+        logger.info(f"[ResumeEvaluator] 🎯 开始调用大模型评估 {candidate_name} 的在线简历...")
+
+        # 3. 构造大模型输入（直接把在线简历内容作为评估内容）
+        eval_input = {
+            "name": candidate_name,
+            "title": "在线简历",
+            "experience": "详见简历",
+            "education": "详见简历",
+            "salary": "面议",
+            "company": "详见简历",
+            "advantage": resume_text[:1500]  # 大段简历正文限制在 1500 字，防止 Token 溢出
+        }
+        
+        # 4. 调用评分
+        scored_list = await _evaluate_batch([eval_input], job_info)
+        if not scored_list:
+            return
+        scored = scored_list[0]
+        
+        match_score = scored.get("matchScore", 5.0)
+        match_reason = scored.get("matchReason", "在线简历评估未返回详细原因")
+        
+        # 5. 生成跟进消息
+        followup_text = await _generate_followup(scored, job_info, match_reason)
+        
+        # 6. 保存回数据库
+        db = await get_db()
+        try:
+            await db.execute(
+                """UPDATE recommendations 
+                   SET match_score = ?, match_reason = ?, followup_text = ?
+                   WHERE id = ?""",
+                (match_score, match_reason, followup_text, rec_id)
+            )
+            await db.commit()
+            logger.info(f"[ResumeEvaluator] ✅ 在线简历背景评估完成: name={candidate_name}, score={match_score}")
+        finally:
+            await db.close()
+            
+    except Exception as e:
+        logger.error(f"[ResumeEvaluator] 在线简历评估异常: {e}")
+
+
+@app.get("/api/candidates/check_evaluated")
+async def check_candidate_evaluated(chat_id: str, name: str):
+    """请求后端校验该候选人是否已有聊天记录及匹配评分"""
+    from db.database import get_db
+    db = await get_db()
+    try:
+        # 1. 查找 candidate
+        cursor = await db.execute("SELECT id FROM candidates WHERE boss_chat_id = ?", (chat_id,))
+        cand_row = await cursor.fetchone()
+        if not cand_row:
+            return {"evaluated": False, "has_messages": False}
+        candidate_id = cand_row["id"]
+        
+        # 2. 检查消息数量
+        cursor = await db.execute("SELECT COUNT(*) as msg_count FROM messages WHERE candidate_id = ?", (candidate_id,))
+        msg_row = await cursor.fetchone()
+        has_messages = (msg_row["msg_count"] > 0) if msg_row else False
+        
+        # 3. 检查 recommendations 表是否有 match_score (不限来源)
+        cursor = await db.execute(
+            """SELECT match_score FROM recommendations 
+               WHERE candidate_id = ? AND match_score IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1""",
+            (candidate_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row["match_score"] is not None:
+            return {"evaluated": True, "has_messages": has_messages}
+            
+        # 兜底通过姓名查 recommendations 表 (不限来源)
+        cursor = await db.execute(
+            """SELECT match_score FROM recommendations 
+               WHERE candidate_name = ? AND match_score IS NOT NULL
+               ORDER BY created_at DESC LIMIT 1""",
+            (name,)
+        )
+        row = await cursor.fetchone()
+        if row and row["match_score"] is not None:
+            return {"evaluated": True, "has_messages": has_messages}
+            
+        return {"evaluated": False, "has_messages": has_messages}
+    except Exception as e:
+        logger.error(f"check_candidate_evaluated 发生错误: {e}")
+        return {"evaluated": False, "has_messages": False}
+    finally:
+        await db.close()
 
 
 # ============================================================
@@ -286,17 +535,89 @@ async def create_job(job_data: dict):
 # ============================================================
 
 @app.get("/api/greetings")
-async def get_greetings(limit: int = 50, status: str = 'sent'):
+async def get_greetings(page: int = 1, limit: int = 15, status: str = 'sent'):
     """获取打招呼历史"""
-    history = await get_greeting_history(limit, status_filter=status)
-    return {"greetings": history}
+    from db.database import get_greeting_history_paginated
+    result = await get_greeting_history_paginated(page=page, limit=limit, status_filter=status)
+    return result
 
 
 @app.get("/api/recommendations")
-async def get_recommendations(limit: int = 50, status: str = 'sent'):
+async def get_recommendations(page: int = 1, limit: int = 15, status: str = 'sent'):
     """获取打招呼和评估历史（推荐路径）"""
-    history = await get_greeting_history(limit, status_filter=status)
-    return {"greetings": history}
+    from db.database import get_greeting_history_paginated
+    result = await get_greeting_history_paginated(page=page, limit=limit, status_filter=status)
+    return result
+
+
+@app.get("/api/stats/daily")
+async def get_daily_stats_api():
+    """获取今日累计的统计数据"""
+    from db.database import get_daily_stats
+    stats = await get_daily_stats()
+    return {"ok": True, "stats": stats}
+
+
+@app.get("/api/chat/candidates")
+async def get_chat_candidates(q: str = None):
+    """获取有聊天记录的候选人列表，按最后消息时间倒序"""
+    from db.database import get_db
+    db = await get_db()
+    try:
+        if q:
+            query = """
+                SELECT c.id, c.name, c.boss_chat_id, COALESCE(c.current_title, r.candidate_title) as current_title, c.experience_years, c.status,
+                       m.content as last_message_content, m.created_at as last_message_time, m.role as last_message_role,
+                       r.match_score, r.match_reason,
+                       r.candidate_experience, r.candidate_education, r.candidate_salary, r.candidate_company, r.followup_text
+                FROM candidates c
+                INNER JOIN (
+                    SELECT candidate_id, content, created_at, role,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id ORDER BY created_at DESC) as rn
+                    FROM messages
+                ) m ON c.id = m.candidate_id AND m.rn = 1
+                LEFT JOIN (
+                    SELECT candidate_id, match_score, match_reason, candidate_title,
+                           candidate_experience, candidate_education, candidate_salary, candidate_company, followup_text,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id ORDER BY created_at DESC) as rn
+                    FROM recommendations
+                    WHERE candidate_id IS NOT NULL
+                ) r ON c.id = r.candidate_id AND r.rn = 1
+                WHERE c.name LIKE ?
+                ORDER BY last_message_time DESC
+            """
+            cursor = await db.execute(query, (f"%{q}%",))
+        else:
+            query = """
+                SELECT c.id, c.name, c.boss_chat_id, COALESCE(c.current_title, r.candidate_title) as current_title, c.experience_years, c.status,
+                       m.content as last_message_content, m.created_at as last_message_time, m.role as last_message_role,
+                       r.match_score, r.match_reason,
+                       r.candidate_experience, r.candidate_education, r.candidate_salary, r.candidate_company, r.followup_text
+                FROM candidates c
+                INNER JOIN (
+                    SELECT candidate_id, content, created_at, role,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id ORDER BY created_at DESC) as rn
+                    FROM messages
+                ) m ON c.id = m.candidate_id AND m.rn = 1
+                LEFT JOIN (
+                    SELECT candidate_id, match_score, match_reason, candidate_title,
+                           candidate_experience, candidate_education, candidate_salary, candidate_company, followup_text,
+                           ROW_NUMBER() OVER (PARTITION BY candidate_id ORDER BY created_at DESC) as rn
+                    FROM recommendations
+                    WHERE candidate_id IS NOT NULL
+                ) r ON c.id = r.candidate_id AND r.rn = 1
+                ORDER BY last_message_time DESC
+            """
+            cursor = await db.execute(query)
+            
+        rows = await cursor.fetchall()
+        candidates = [dict(row) for row in rows]
+        return {"ok": True, "candidates": candidates}
+    except Exception as e:
+        logger.error(f"Failed to fetch chat candidates: {e}")
+        return {"ok": False, "candidates": [], "error": str(e)}
+    finally:
+        await db.close()
 
 
 @app.get("/api/greetings/quota")
@@ -332,6 +653,78 @@ async def get_candidate_messages(candidate_id: int):
         return {"messages": [], "error": str(e)}
     finally:
         await db.close()
+
+
+# ============================================================
+# REST API — DOM 校准诊断
+# ============================================================
+
+import base64
+from pathlib import Path
+from datetime import datetime
+
+DIAGNOSTIC_DIR = Path(__file__).parent / "data" / "diagnostics"
+
+
+@app.post("/api/diagnostic")
+async def receive_diagnostic(data: dict):
+    """接收前端 Preflight Check 校准诊断数据（DOM 结构 + 截图）"""
+    DIAGNOSTIC_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    module = data.get("module", "unknown")
+    report_id = f"{module}_{timestamp}"
+    report_dir = DIAGNOSTIC_DIR / report_id
+    report_dir.mkdir(exist_ok=True)
+
+    # 保存 DOM 诊断数据 (JSON)，排除 screenshot 字段以减小体积
+    dom_data = {k: v for k, v in data.items() if k != "screenshot"}
+    (report_dir / "diagnostic.json").write_text(
+        json.dumps(dom_data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 保存截图 (PNG)
+    screenshot_b64 = data.get("screenshot", "")
+    if screenshot_b64 and isinstance(screenshot_b64, str) and screenshot_b64.startswith("data:image"):
+        try:
+            img_data = base64.b64decode(screenshot_b64.split(",")[1])
+            (report_dir / "screenshot.png").write_bytes(img_data)
+            logger.info(f"📸 截图已保存: {report_dir / 'screenshot.png'}")
+        except Exception as e:
+            logger.warning(f"截图解码失败: {e}")
+
+    logger.info(f"📋 收到诊断数据: {report_id} (模块: {module})")
+    logger.info(f"   失败选择器: {list(dom_data.get('failedSelectors', {}).keys())}")
+    logger.info(f"   报告路径: {report_dir}")
+
+    return {"ok": True, "reportId": report_id, "path": str(report_dir)}
+
+
+@app.get("/api/diagnostic")
+async def list_diagnostics():
+    """列出所有诊断报告"""
+    if not DIAGNOSTIC_DIR.exists():
+        return {"reports": []}
+    reports = sorted(DIAGNOSTIC_DIR.iterdir(), key=lambda p: p.name, reverse=True)
+    result = []
+    for r in reports[:20]:
+        info = {"id": r.name, "path": str(r)}
+        # 读取 diagnostic.json 的基本信息
+        diag_file = r / "diagnostic.json"
+        if diag_file.exists():
+            try:
+                diag = json.loads(diag_file.read_text(encoding="utf-8"))
+                info["module"] = diag.get("module", "unknown")
+                info["url"] = diag.get("url", "")
+                info["timestamp"] = diag.get("timestamp", "")
+                info["failedCount"] = len(diag.get("failedSelectors", {}))
+                info["passedCount"] = len(diag.get("passedSelectors", {}))
+                info["hasScreenshot"] = (r / "screenshot.png").exists()
+            except Exception:
+                pass
+        result.append(info)
+    return {"reports": result}
 
 
 # ============================================================
@@ -1045,6 +1438,249 @@ async def dashboard():
                 margin-top: 4px;
                 text-align: right;
             }
+
+            /* Main Navigation Styles */
+            .main-nav {
+                display: flex;
+                gap: 12px;
+                margin-bottom: 24px;
+                border-bottom: 1px solid var(--border-color);
+                padding-bottom: 16px;
+            }
+
+            .nav-btn {
+                background: rgba(255, 255, 255, 0.02);
+                border: 1px solid var(--border-color);
+                color: var(--text-secondary);
+                padding: 10px 20px;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+                display: flex;
+                align-items: center;
+                gap: 8px;
+            }
+
+            .nav-btn:hover {
+                color: var(--text-primary);
+                background: rgba(255, 255, 255, 0.05);
+                border-color: rgba(255, 255, 255, 0.15);
+            }
+
+            .nav-btn.active {
+                color: #ffffff;
+                background: var(--color-primary);
+                border-color: var(--color-primary);
+                box-shadow: 0 4px 20px rgba(99, 102, 241, 0.35);
+            }
+
+            /* Pagination Styles */
+            .pagination-container {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-top: 20px;
+                padding-top: 16px;
+                border-top: 1px solid var(--border-color);
+            }
+
+            .pagination-info {
+                font-size: 13px;
+                color: var(--text-secondary);
+            }
+
+            .pagination-buttons {
+                display: flex;
+                gap: 8px;
+            }
+
+            .page-btn {
+                background: rgba(255, 255, 255, 0.03);
+                border: 1px solid var(--border-color);
+                color: var(--text-primary);
+                padding: 6px 14px;
+                border-radius: 8px;
+                font-size: 13px;
+                cursor: pointer;
+                transition: all 0.2s;
+                display: flex;
+                align-items: center;
+                gap: 4px;
+            }
+
+            .page-btn:hover:not(:disabled) {
+                border-color: var(--color-primary);
+                background: var(--color-primary-glow);
+                color: #ffffff;
+            }
+
+            .page-btn:disabled {
+                opacity: 0.3;
+                cursor: not-allowed;
+            }
+
+            /* Chat History View (Split Screen layout) */
+            .chat-module-container {
+                display: grid;
+                grid-template-columns: 340px 1fr;
+                gap: 24px;
+                height: calc(100vh - 220px);
+                min-height: 650px;
+                align-items: stretch;
+            }
+
+            .chat-sidebar {
+                display: flex;
+                flex-direction: column;
+                padding: 20px;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            .sidebar-header {
+                margin-bottom: 16px;
+            }
+
+            .search-input {
+                width: 100%;
+                background: rgba(0, 0, 0, 0.25);
+                border: 1px solid var(--border-color);
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: var(--text-primary);
+                font-size: 13px;
+                outline: none;
+                transition: all 0.2s;
+            }
+
+            .search-input:focus {
+                border-color: var(--color-primary);
+                box-shadow: 0 0 0 2px var(--color-primary-glow);
+            }
+
+            .candidate-list {
+                flex: 1;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                padding-right: 6px;
+            }
+
+            .candidate-item {
+                background: rgba(255, 255, 255, 0.02);
+                border: 1px solid var(--border-color);
+                border-radius: 12px;
+                padding: 14px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+            }
+
+            .candidate-item:hover {
+                background: rgba(255, 255, 255, 0.05);
+                border-color: rgba(255, 255, 255, 0.15);
+            }
+
+            .candidate-item.active {
+                background: var(--color-primary-glow);
+                border-color: rgba(99, 102, 241, 0.4);
+            }
+
+            .candidate-item-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 6px;
+            }
+
+            .candidate-item-name {
+                font-weight: 600;
+                font-size: 14px;
+                color: var(--text-primary);
+            }
+
+            .candidate-item-time {
+                font-size: 11px;
+                color: var(--text-secondary);
+            }
+
+            .candidate-item-snippet {
+                font-size: 12px;
+                color: var(--text-secondary);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+
+            .chat-main {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            .chat-window {
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+            }
+
+            .chat-window-active {
+                display: flex;
+                flex-direction: column;
+                height: 100%;
+                gap: 20px;
+            }
+
+            .chat-header {
+                padding: 20px;
+            }
+
+            .chat-header-name-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+
+            .chat-header-name {
+                font-size: 20px;
+                font-weight: 700;
+                font-family: var(--font-display);
+            }
+
+            .chat-header-meta {
+                font-size: 13px;
+                color: var(--text-secondary);
+                margin-top: 6px;
+            }
+
+            .chat-workspace {
+                display: grid;
+                grid-template-columns: 1fr 320px;
+                gap: 20px;
+                flex: 1;
+                min-height: 0;
+            }
+
+            .chat-message-pane {
+                display: flex;
+                flex-direction: column;
+                padding: 20px;
+                height: 100%;
+            }
+
+            .chat-info-pane {
+                padding: 20px;
+                height: 100%;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+            }
         </style>
     </head>
     <body>
@@ -1065,6 +1701,17 @@ async def dashboard():
                 </div>
             </header>
 
+            <!-- Main Navigation Tabs -->
+            <div class="main-nav">
+                <button class="nav-btn active" id="navBtn-dashboard" onclick="switchMainView('dashboard')">
+                    📊 监控面板
+                </button>
+                <button class="nav-btn" id="navBtn-chat" onclick="switchMainView('chat')">
+                    💬 历史聊天记录
+                </button>
+            </div>
+
+            <div id="view-dashboard">
             <!-- Top Row Stats -->
             <div class="dashboard-grid">
                 <div class="card">
@@ -1190,6 +1837,19 @@ async def dashboard():
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+                        <div class="pagination-container">
+                            <div class="pagination-info" id="greetingPaginationInfo">
+                                共 0 条记录，当前第 1 / 1 页
+                            </div>
+                            <div class="pagination-buttons">
+                                <button class="page-btn" id="btnPrevPage" onclick="changeGreetingPage(-1)" disabled>
+                                    ◀ 上一页
+                                </button>
+                                <button class="page-btn" id="btnNextPage" onclick="changeGreetingPage(1)" disabled>
+                                    下一页 ▶
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1317,7 +1977,64 @@ async def dashboard():
                 <button class="toggle-btn" onclick="toggleDebug()">🛠️ 显示完整系统 JSON 状态</button>
                 <pre id="debugState">加载中...</pre>
             </div>
-        </div>
+            </div> <!-- end of view-dashboard -->
+
+            <!-- Chat View Section (Split Screen layout Option A) -->
+            <div id="view-chat" class="chat-module-container" style="display: none;">
+                <!-- Left: Candidates list -->
+                <div class="chat-sidebar card">
+                    <div class="sidebar-header">
+                        <input type="text" id="chatSearchInput" class="search-input" placeholder="🔍 搜索候选人姓名..." oninput="handleChatSearch()">
+                    </div>
+                    <div class="candidate-list" id="chatCandidateList">
+                        <div style="text-align: center; color: var(--text-secondary); padding: 20px;">暂无有聊天记录的候选人</div>
+                    </div>
+                </div>
+                <!-- Right: Chat Window & Info Panel -->
+                <div class="chat-main">
+                    <div class="chat-window card" id="chatWindowPlaceholder">
+                        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--text-secondary);">
+                            <span style="font-size: 48px; margin-bottom: 16px;">💬</span>
+                            <span style="font-weight: 500;">请从左侧选择一个候选人以查看聊天记录</span>
+                        </div>
+                    </div>
+                    
+                    <div class="chat-window-active" id="chatWindowActive" style="display: none;">
+                        <!-- Top header of the active conversation -->
+                        <div class="chat-header card">
+                            <div class="chat-header-info">
+                                <div class="chat-header-name-row">
+                                    <span class="chat-header-name" id="activeChatName">候选人姓名</span>
+                                    <span id="activeChatScoreBadge"></span>
+                                </div>
+                                <div class="chat-header-meta" id="activeChatMeta">工作经历 · 学历 · 薪资</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Middle: Scrollable messages and candidate matching details (split screen) -->
+                        <div class="chat-workspace">
+                            <!-- Left: Messages bubble list -->
+                            <div class="chat-message-pane card">
+                                <div class="chat-bubble-container" id="activeChatBubbleContainer" style="max-height: none; flex: 1; height: 100%;">
+                                    <!-- Messages bubble list -->
+                                </div>
+                            </div>
+                            <!-- Right: Candidate match analysis detail panel -->
+                            <div class="chat-info-pane card">
+                                <div class="info-block" style="margin-bottom: 8px;">
+                                    <div class="info-block-title">智能评估理由</div>
+                                    <div id="activeChatReason" style="line-height: 1.6; font-size: 13px; max-height: 220px; overflow-y: auto; white-space: pre-wrap;">-</div>
+                                </div>
+                                <div class="info-block">
+                                    <div class="info-block-title">已发/预设跟进消息</div>
+                                    <div id="activeChatFollowup" style="line-height: 1.6; font-size: 13px; max-height: 220px; overflow-y: auto; color: #a5b4fc; white-space: pre-wrap;">-</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div> <!-- end of container -->
 
         <!-- Detail Modal -->
         <div class="modal" id="candidateModal">
@@ -1571,17 +2288,48 @@ async def dashboard():
                     // 4. Fetch Greetings History
                     await refreshGreetingsHistory();
 
+                    // 5. 若当前在聊天页面，静默刷新当前选中的候选人聊天记录气泡
+                    const viewChat = document.getElementById('view-chat');
+                    if (viewChat && viewChat.style.display === 'grid' && currentSelectedCandidateId) {
+                        await refreshActiveChatMessagePane();
+                    }
+
                 } catch(e) {
                     console.error("Dashboard refresh error: ", e);
                 }
             }
 
+            // 主视图切换控制器 (方案 A)
+            function switchMainView(view) {
+                const views = ['dashboard', 'chat'];
+                views.forEach(v => {
+                    const el = document.getElementById(`view-${v}`);
+                    const btn = document.getElementById(`navBtn-${v}`);
+                    if (v === view) {
+                        el.style.display = (v === 'chat') ? 'grid' : 'block';
+                        btn.classList.add('active');
+                    } else {
+                        el.style.display = 'none';
+                        btn.classList.remove('active');
+                    }
+                });
+
+                if (view === 'chat') {
+                    loadChatCandidates();
+                }
+            }
+
+            // 打招呼列表分页状态与处理器
             let currentActiveTab = 'all';
+            let greetingCurrentPage = 1;
+            let greetingTotalPages = 1;
+            const greetingPageLimit = 15;
 
             async function switchGreetingTab(status) {
                 currentActiveTab = status;
+                greetingCurrentPage = 1; // 切换 Tab 时重置为第一页
                 
-                // Update active tab buttons visual state
+                // 更新 tab 按钮高亮状态
                 const buttons = document.querySelectorAll('.crp-tab-btn');
                 buttons.forEach(btn => {
                     if (btn.id === `tabBtn-${status}`) {
@@ -1591,20 +2339,37 @@ async def dashboard():
                     }
                 });
                 
-                // Set loading status in table body
+                // 表格展示加载中
                 const tbody = document.getElementById('greetingsTableBody');
                 tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">加载中...</td></tr>';
                 
-                // Immediately refresh greetings history
+                await refreshGreetingsHistory();
+            }
+
+            async function changeGreetingPage(delta) {
+                const targetPage = greetingCurrentPage + delta;
+                if (targetPage < 1 || targetPage > greetingTotalPages) return;
+                greetingCurrentPage = targetPage;
+                
+                const tbody = document.getElementById('greetingsTableBody');
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">加载中...</td></tr>';
+                
                 await refreshGreetingsHistory();
             }
 
             async function refreshGreetingsHistory() {
                 try {
-                    const greetRes = await fetch(`/api/greetings?limit=30&status=${currentActiveTab}`);
+                    const greetRes = await fetch(`/api/greetings?page=${greetingCurrentPage}&limit=${greetingPageLimit}&status=${currentActiveTab}`);
                     const greetData = await greetRes.json();
                     const list = greetData.greetings || [];
+                    const total = greetData.total || 0;
+                    greetingTotalPages = greetData.total_pages || 1;
                     activeGreetingsList = list;
+
+                    // 更新分页控制器显示与可用状态
+                    document.getElementById('greetingPaginationInfo').textContent = `共 ${total} 条记录，当前第 ${greetingCurrentPage} / ${greetingTotalPages} 页`;
+                    document.getElementById('btnPrevPage').disabled = (greetingCurrentPage <= 1);
+                    document.getElementById('btnNextPage').disabled = (greetingCurrentPage >= greetingTotalPages);
 
                     const tbody = document.getElementById('greetingsTableBody');
                     if (list.length === 0) {
@@ -1638,7 +2403,174 @@ async def dashboard():
                 }
             }
 
-            // Initial and interval refresh
+            // 聊天记录管理页面控制逻辑
+            let activeCandidatesList = [];
+            let currentSelectedCandidateId = null;
+
+            async function loadChatCandidates() {
+                try {
+                    const q = document.getElementById('chatSearchInput').value.trim();
+                    const url = q ? `/api/chat/candidates?q=${encodeURIComponent(q)}` : '/api/chat/candidates';
+                    const res = await fetch(url);
+                    const data = await res.json();
+                    const list = data.candidates || [];
+                    activeCandidatesList = list;
+
+                    const listContainer = document.getElementById('chatCandidateList');
+                    if (list.length === 0) {
+                        listContainer.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 20px;">未找到有聊天记录的候选人</div>';
+                    } else {
+                        listContainer.innerHTML = list.map((c, index) => {
+                            const activeClass = (c.id === currentSelectedCandidateId) ? 'active' : '';
+                            const timeStr = formatTime(c.last_message_time);
+                            const lastMsgPrefix = c.last_message_role === 'copilot' ? 'Copilot: ' : '候选人: ';
+                            return `
+                                <div class="candidate-item ${activeClass}" onclick="selectChatCandidate(${c.id}, ${index})">
+                                    <div class="candidate-item-header">
+                                        <span class="candidate-item-name">${c.name || '未知候选人'}</span>
+                                        <span class="candidate-item-time">${timeStr}</span>
+                                    </div>
+                                    <div class="candidate-item-snippet">${lastMsgPrefix}${c.last_message_content || ''}</div>
+                                </div>
+                            `;
+                        }).join('');
+                    }
+                } catch (e) {
+                    console.error("Failed to load chat candidates:", e);
+                }
+            }
+
+            let searchTimeout = null;
+            function handleChatSearch() {
+                if (searchTimeout) clearTimeout(searchTimeout);
+                searchTimeout = setTimeout(loadChatCandidates, 300);
+            }
+
+            async function selectChatCandidate(candidateId, index) {
+                currentSelectedCandidateId = candidateId;
+                
+                // 列表选中态高亮
+                const items = document.querySelectorAll('.candidate-item');
+                items.forEach((item, idx) => {
+                    if (idx === index) item.classList.add('active');
+                    else item.classList.remove('active');
+                });
+
+                const candidate = activeCandidatesList[index];
+                if (!candidate) return;
+
+                // 显示对话窗口
+                document.getElementById('chatWindowPlaceholder').style.display = 'none';
+                document.getElementById('chatWindowActive').style.display = 'flex';
+
+                // 设置头部及元数据
+                document.getElementById('activeChatName').textContent = candidate.name || '未知候选人';
+                document.getElementById('activeChatScoreBadge').innerHTML = getScoreBadge(candidate.match_score);
+                
+                const exp = candidate.candidate_experience || '未知年限';
+                const edu = candidate.candidate_education || '未知学历';
+                const sal = candidate.candidate_salary || '未知薪资';
+                const company = candidate.candidate_company ? ` · 最近公司: ${candidate.candidate_company}` : '';
+                document.getElementById('activeChatMeta').textContent = `${candidate.current_title || '未知职位'} (${exp} / ${edu} / ${sal})${company}`;
+
+                // 侧边栏智能评估理由及跟进
+                document.getElementById('activeChatReason').textContent = candidate.match_reason || '无智能评估理由';
+                document.getElementById('activeChatFollowup').textContent = candidate.followup_text ? `"${candidate.followup_text}"` : '未发送或无跟进消息';
+
+                // 获取并载入消息列表
+                const bubbleContainer = document.getElementById('activeChatBubbleContainer');
+                bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--text-secondary); padding: 20px;">正在加载对话记录...</div>';
+
+                try {
+                    const res = await fetch(`/api/candidates/${candidateId}/messages`);
+                    const data = await res.json();
+                    const messages = data.messages || [];
+                    
+                    if (messages.length === 0) {
+                        bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--text-secondary); padding: 20px;">暂无对话消息记录</div>';
+                    } else {
+                        bubbleContainer.innerHTML = messages.map(msg => {
+                            const bubbleClass = msg.role === 'copilot' ? 'copilot' : 'candidate';
+                            const roleLabel = msg.role === 'copilot' ? 'Copilot 助手' : candidate.name;
+                            return `
+                                <div class="chat-bubble ${bubbleClass}">
+                                    <div style="font-weight: 600; font-size: 11px; margin-bottom: 2px;">${roleLabel}</div>
+                                    <div>${msg.content}</div>
+                                    <div class="chat-bubble-time">${formatTime(msg.created_at)}</div>
+                                </div>
+                            `;
+                        }).join('');
+                        
+                        // 滚动到底部
+                        setTimeout(() => {
+                            bubbleContainer.scrollTop = bubbleContainer.scrollHeight;
+                        }, 50);
+                    }
+                } catch (e) {
+                    console.error("Failed to load conversation:", e);
+                    bubbleContainer.innerHTML = '<div style="text-align: center; font-size: 12px; color: var(--color-error); padding: 20px;">加载失败，请检查服务连接</div>';
+                }
+            }
+
+            async function refreshActiveChatMessagePane() {
+                if (!currentSelectedCandidateId) return;
+                const bubbleContainer = document.getElementById('activeChatBubbleContainer');
+                try {
+                    const res = await fetch(`/api/candidates/${currentSelectedCandidateId}/messages`);
+                    const data = await res.json();
+                    const messages = data.messages || [];
+                    if (messages.length > 0) {
+                        const candidate = activeCandidatesList.find(c => c.id === currentSelectedCandidateId);
+                        const nameLabel = candidate ? candidate.name : '候选人';
+                        
+                        // 对比当前气泡数量，防止每次刷新导致闪烁或滚动位置丢失
+                        const currentBubbles = bubbleContainer.querySelectorAll('.chat-bubble');
+                        if (messages.length !== currentBubbles.length) {
+                            const isNearBottom = bubbleContainer.scrollHeight - bubbleContainer.scrollTop - bubbleContainer.clientHeight < 50;
+                            
+                            bubbleContainer.innerHTML = messages.map(msg => {
+                                const bubbleClass = msg.role === 'copilot' ? 'copilot' : 'candidate';
+                                const roleLabel = msg.role === 'copilot' ? 'Copilot 助手' : nameLabel;
+                                return `
+                                    <div class="chat-bubble ${bubbleClass}">
+                                        <div style="font-weight: 600; font-size: 11px; margin-bottom: 2px;">${roleLabel}</div>
+                                        <div>${msg.content}</div>
+                                        <div class="chat-bubble-time">${formatTime(msg.created_at)}</div>
+                                    </div>
+                                `;
+                            }).join('');
+                            
+                            if (isNearBottom) {
+                                bubbleContainer.scrollTop = bubbleContainer.scrollHeight;
+                            }
+                        }
+                    }
+
+                    // 同时静默获取当前候选人最新画像以更新评估原因、职位及分数（防止刚上报的微简历和背景评估未展示）
+                    const q = document.getElementById('chatSearchInput').value.trim();
+                    const listRes = await fetch(q ? `/api/chat/candidates?q=${encodeURIComponent(q)}` : '/api/chat/candidates');
+                    const listData = await listRes.json();
+                    const list = listData.candidates || [];
+                    activeCandidatesList = list;
+                    
+                    const candidate = list.find(c => c.id === currentSelectedCandidateId);
+                    if (candidate) {
+                        document.getElementById('activeChatScoreBadge').innerHTML = getScoreBadge(candidate.match_score);
+                        document.getElementById('activeChatReason').textContent = candidate.match_reason || '无智能评估理由';
+                        document.getElementById('activeChatFollowup').textContent = candidate.followup_text ? `"${candidate.followup_text}"` : '未发送或无跟进消息';
+                        
+                        const exp = candidate.candidate_experience || '未知年限';
+                        const edu = candidate.candidate_education || '未知学历';
+                        const sal = candidate.candidate_salary || '未知薪资';
+                        const company = candidate.candidate_company ? ` · 最近公司: ${candidate.candidate_company}` : '';
+                        document.getElementById('activeChatMeta').textContent = `${candidate.current_title || '未知职位'} (${exp} / ${edu} / ${sal})${company}`;
+                    }
+                } catch (e) {
+                    console.error("Silent message refresh failed: ", e);
+                }
+            }
+
+            // 初始刷新与周期刷新
             refreshDashboard();
             setInterval(refreshDashboard, 5000);
         </script>
